@@ -57,6 +57,26 @@ jobs:
           TAG="dev-${SHORT_SHA}"
           gh release create "${TAG}" \
             --title "dev-${SHORT_SHA}" \
-            --notes "Pre-release build from commit ${GITHUB_SHA}" \
+            --notes "Pre-release build from commit ${GITHUB_SHA}
+
+          ## Install with mise
+
+          \`\`\`sh
+          mise use -g github:ekroon/copilot-codespace
+          \`\`\`" \
             --prerelease \
+            copilot-codespace-*
+
+          # Update the 'latest' tag so mise can resolve @latest
+          gh release delete latest --yes 2>/dev/null || true
+          git push origin :refs/tags/latest 2>/dev/null || true
+          gh release create latest \
+            --title "Latest (dev-${SHORT_SHA})" \
+            --notes "Latest build from commit ${GITHUB_SHA}
+
+          ## Install with mise
+
+          \`\`\`sh
+          mise use -g github:ekroon/copilot-codespace
+          \`\`\`" \
             copilot-codespace-*
