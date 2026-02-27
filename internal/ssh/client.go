@@ -212,10 +212,23 @@ func tmuxSessionName(sessionID string) string {
 }
 
 // StartSession creates a named tmux session running the given command on the codespace.
+// Uses remain-on-exit so the pane stays readable even after the command exits.
 func (c *Client) StartSession(ctx context.Context, sessionID, command string) error {
 	name := tmuxSessionName(sessionID)
-	cmd := fmt.Sprintf("tmux new-session -d -s %s -x 200 -y 50 %s",
-		shellQuote(name), shellQuote(command))
+
+	// Ensure tmux is available, install if missing (Debian-based devcontainers)
+	_, _, exitCode, _ := c.Exec(ctx, "command -v tmux")
+	if exitCode != 0 {
+		c.Exec(ctx, "sudo apt-get update -qq && sudo apt-get install -y -qq tmux 2>/dev/null")
+		if _, _, ec, _ := c.Exec(ctx, "command -v tmux"); ec != 0 {
+			return fmt.Errorf("tmux is not available on the codespace and could not be installed")
+		}
+	}
+
+	// Create session with remain-on-exit so we can read output after command finishes
+	cmd := fmt.Sprintf(
+		"tmux new-session -d -s %s -x 200 -y 50 %s && tmux set-option -t %s remain-on-exit on",
+		shellQuote(name), shellQuote(command), shellQuote(name))
 
 	_, stderr, exitCode, err := c.Exec(ctx, cmd)
 	if err != nil {
@@ -299,10 +312,17 @@ func (c *Client) WriteSession(ctx context.Context, sessionID, input string) erro
 }
 
 // ReadSession captures the current tmux pane content (last 100 lines) from the codespace.
+// Works even after the command has exited (thanks to remain-on-exit).
 func (c *Client) ReadSession(ctx context.Context, sessionID string) (string, error) {
 	name := tmuxSessionName(sessionID)
-	cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -100", shellQuote(name))
 
+	// Check if session exists
+	checkCmd := fmt.Sprintf("tmux has-session -t %s 2>/dev/null", shellQuote(name))
+	if _, _, ec, _ := c.Exec(ctx, checkCmd); ec != 0 {
+		return "", fmt.Errorf("session %q does not exist (command may have exited and been cleaned up)", sessionID)
+	}
+
+	cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -100", shellQuote(name))
 	stdout, stderr, exitCode, err := c.Exec(ctx, cmd)
 	if err != nil {
 		return "", fmt.Errorf("read session: %w", err)
@@ -310,6 +330,14 @@ func (c *Client) ReadSession(ctx context.Context, sessionID string) (string, err
 	if exitCode != 0 {
 		return "", fmt.Errorf("read session failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
 	}
+
+	// Check if the pane is dead (command exited)
+	statusCmd := fmt.Sprintf("tmux list-panes -t %s -F '#{pane_dead} #{pane_dead_status}' 2>/dev/null", shellQuote(name))
+	statusOut, _, _, _ := c.Exec(ctx, statusCmd)
+	if strings.HasPrefix(strings.TrimSpace(statusOut), "1") {
+		stdout += "\n[session exited]"
+	}
+
 	return stdout, nil
 }
 
