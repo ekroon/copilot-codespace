@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -47,6 +48,13 @@ func runMCPServer() {
 	}
 
 	sshClient := ssh.NewClient(codespaceName)
+
+	// Establish SSH multiplexing for fast command execution
+	ctx := context.Background()
+	if err := sshClient.SetupMultiplexing(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "codespace-mcp: multiplexing setup warning: %v\n", err)
+	}
+
 	mcpServer := mcp.NewServer(sshClient)
 
 	log.SetOutput(os.Stderr)
@@ -140,7 +148,9 @@ func runLauncher() error {
 	fmt.Printf("\nLaunching Copilot CLI with remote codespace tools...\n")
 	fmt.Printf("  Codespace: %s\n", selected.Name)
 	fmt.Printf("  Workspace: %s\n", workdir)
-	fmt.Printf("  Excluded:  %d local tools\n\n", len(excludedTools))
+	fmt.Printf("  Excluded:  %d local tools\n", len(excludedTools))
+	fmt.Printf("\n  Shell access (from another terminal):\n")
+	fmt.Printf("    gh codespace ssh -c %s\n\n", selected.Name)
 
 	// Exec copilot from the instructions dir (cwd is already set)
 	return execCopilot(excludedTools, mcpConfig)

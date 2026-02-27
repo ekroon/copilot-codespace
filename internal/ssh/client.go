@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -15,6 +16,9 @@ import (
 type Client struct {
 	codespaceName string
 	mu            sync.Mutex
+	sshConfigPath string // path to generated SSH config with ControlMaster
+	sshHost       string // SSH host alias (e.g., "cs.develop-xxx")
+	controlSocket string // path to control socket
 }
 
 // NewClient creates a new SSH client for the given codespace.
@@ -22,15 +26,109 @@ func NewClient(codespaceName string) *Client {
 	return &Client{codespaceName: codespaceName}
 }
 
+// SetupMultiplexing generates an SSH config with ControlMaster and establishes
+// a persistent connection. Subsequent Exec calls use this connection (~0.1s vs ~3s).
+func (c *Client) SetupMultiplexing(ctx context.Context) error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("getting home dir: %w", err)
+	}
+
+	configDir := filepath.Join(homeDir, ".copilot", "codespace-workdirs")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return fmt.Errorf("creating config dir: %w", err)
+	}
+
+	c.controlSocket = filepath.Join(configDir, ".ssh-"+c.codespaceName)
+	c.sshConfigPath = filepath.Join(configDir, ".ssh-config-"+c.codespaceName)
+
+	// Get SSH config from gh (contains ProxyCommand, identity file, etc.)
+	ghConfig, err := exec.CommandContext(ctx, "gh", "codespace", "ssh",
+		"--config", "-c", c.codespaceName).Output()
+	if err != nil {
+		return fmt.Errorf("getting SSH config: %w", err)
+	}
+
+	config := string(ghConfig)
+
+	// Parse the Host line from gh config (e.g., "Host cs.develop-xxx.main")
+	for _, line := range strings.Split(config, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Host ") {
+			c.sshHost = strings.TrimPrefix(line, "Host ")
+			break
+		}
+	}
+	if c.sshHost == "" {
+		return fmt.Errorf("could not parse Host from SSH config")
+	}
+
+	// Add ControlPath + ControlPersist if not present
+	if !strings.Contains(config, "ControlPath") {
+		config += fmt.Sprintf("\tControlPath %s\n", c.controlSocket)
+	}
+	if !strings.Contains(config, "ControlPersist") {
+		config += "\tControlPersist 600\n"
+	}
+
+	if err := os.WriteFile(c.sshConfigPath, []byte(config), 0o600); err != nil {
+		return fmt.Errorf("writing SSH config: %w", err)
+	}
+
+	// Establish master connection in background
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-F", c.sshConfigPath,
+		"-o", "ControlMaster=yes",
+		"-o", "ControlPersist=600",
+		"-fN", // background, no command
+		c.sshHost,
+	)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		// Fall back to non-multiplexed mode
+		fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing failed, using fallback: %v\n", err)
+		c.sshConfigPath = ""
+		return nil
+	}
+
+	fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing established\n")
+	return nil
+}
+
+// ControlSocketPath returns the path to the SSH control socket, if multiplexing is active.
+func (c *Client) ControlSocketPath() string {
+	if c.sshConfigPath == "" {
+		return ""
+	}
+	return c.controlSocket
+}
+
+// SSHHost returns the SSH host alias for this codespace.
+func (c *Client) SSHHost() string {
+	return c.sshHost
+}
+
+// SSHConfigPath returns the path to the generated SSH config file.
+func (c *Client) SSHConfigPath() string {
+	return c.sshConfigPath
+}
+
 // Exec runs a command on the codespace and returns stdout, stderr, and exit code.
 func (c *Client) Exec(ctx context.Context, command string) (stdout string, stderr string, exitCode int, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	cmd := exec.CommandContext(ctx, "gh", "codespace", "ssh",
-		"-c", c.codespaceName,
-		"--", command,
-	)
+	var cmd *exec.Cmd
+	if c.sshConfigPath != "" {
+		// Use multiplexed SSH (fast path: ~0.1s per command)
+		cmd = exec.CommandContext(ctx, "ssh", "-F", c.sshConfigPath, c.sshHost, command)
+	} else {
+		// Fallback to gh codespace ssh (~3s per command)
+		cmd = exec.CommandContext(ctx, "gh", "codespace", "ssh",
+			"-c", c.codespaceName,
+			"--", command,
+		)
+	}
 
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
