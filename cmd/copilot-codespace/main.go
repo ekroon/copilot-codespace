@@ -32,6 +32,12 @@ func main() {
 		return
 	}
 
+	// If first arg is "shell", SSH into the codespace (used as $SHELL for ! escape)
+	if len(os.Args) > 1 && os.Args[1] == "shell" {
+		runShell()
+		return
+	}
+
 	// Otherwise, run as interactive launcher
 	if err := runLauncher(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -333,6 +339,29 @@ func ensureTrustedFolder(dir string) error {
 	return os.WriteFile(configPath, out, 0o644)
 }
 
+func runShell() {
+	codespaceName := os.Getenv("CODESPACE_NAME")
+	if codespaceName == "" {
+		fmt.Fprintln(os.Stderr, "CODESPACE_NAME not set")
+		os.Exit(1)
+	}
+
+	ghPath, err := exec.LookPath("gh")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gh not found in PATH")
+		os.Exit(1)
+	}
+
+	// If called as "shell -c <command>", run the command via SSH
+	// Otherwise, open an interactive SSH session
+	if len(os.Args) >= 4 && os.Args[2] == "-c" {
+		cmd := strings.Join(os.Args[3:], " ")
+		syscall.Exec(ghPath, []string{"gh", "codespace", "ssh", "-c", codespaceName, "--", cmd}, os.Environ())
+	} else {
+		syscall.Exec(ghPath, []string{"gh", "codespace", "ssh", "-c", codespaceName}, os.Environ())
+	}
+}
+
 func buildMCPConfig(selfBinary, codespaceName, workdir string) string {
 	config := map[string]any{
 		"mcpServers": map[string]any{
@@ -366,5 +395,22 @@ func execCopilot(excludedTools []string, mcpConfig string) error {
 	// Pass through any extra args from the command line
 	args = append(args, os.Args[1:]...)
 
-	return syscall.Exec(copilotPath, args, os.Environ())
+	// Set SHELL to our own binary's "shell" subcommand so ! escape SSHs into codespace
+	self, _ := os.Executable()
+	env := os.Environ()
+	env = setEnv(env, "SHELL", self)
+
+	return syscall.Exec(copilotPath, args, env)
+}
+
+// setEnv sets or replaces an environment variable in a list.
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }
