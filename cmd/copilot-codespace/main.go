@@ -109,12 +109,16 @@ func runLauncher() error {
 	}
 	fmt.Printf("Workspace: %s\n", workdir)
 
-	// Fetch instruction files into a temp dir that acts as the cwd
+	// Fetch instruction files into a deterministic dir that acts as the cwd
 	instructionsDir, err := fetchInstructionFiles(selected.Name, workdir)
 	if err != nil {
 		return fmt.Errorf("fetching instructions: %w", err)
 	}
-	defer os.RemoveAll(instructionsDir)
+
+	// Ensure the directory is trusted by copilot so it doesn't prompt each time
+	if err := ensureTrustedFolder(instructionsDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not auto-trust directory: %v\n", err)
+	}
 
 	// Initialize as git repo so copilot treats it as a repo root and loads instructions
 	exec.Command("git", "-C", instructionsDir, "init", "-q").Run()
@@ -217,10 +221,20 @@ func sshCommand(codespaceName, command string) (string, error) {
 }
 
 func fetchInstructionFiles(codespaceName, workdir string) (string, error) {
-	tmpDir, err := os.MkdirTemp("", "copilot-instructions-*")
+	// Use a deterministic directory so copilot only needs to trust it once per codespace
+	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("creating temp dir: %w", err)
+		return "", fmt.Errorf("getting home dir: %w", err)
 	}
+	baseDir := filepath.Join(homeDir, ".copilot", "codespace-workdirs", codespaceName)
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		return "", fmt.Errorf("creating workdir: %w", err)
+	}
+	// Clean existing instruction files so stale ones don't persist
+	os.RemoveAll(filepath.Join(baseDir, ".github"))
+	os.Remove(filepath.Join(baseDir, "AGENTS.md"))
+	os.Remove(filepath.Join(baseDir, "CLAUDE.md"))
+	os.Remove(filepath.Join(baseDir, "GEMINI.md"))
 
 	fmt.Println("Fetching instruction files from codespace...")
 
@@ -244,7 +258,7 @@ func fetchInstructionFiles(codespaceName, workdir string) (string, error) {
 		if err != nil {
 			continue
 		}
-		localPath := filepath.Join(tmpDir, relPath)
+		localPath := filepath.Join(baseDir, relPath)
 		if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 			continue
 		}
@@ -268,7 +282,7 @@ func fetchInstructionFiles(codespaceName, workdir string) (string, error) {
 			if err != nil {
 				continue
 			}
-			localPath := filepath.Join(tmpDir, relPath)
+			localPath := filepath.Join(baseDir, relPath)
 			if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 				continue
 			}
@@ -279,7 +293,44 @@ func fetchInstructionFiles(codespaceName, workdir string) (string, error) {
 		}
 	}
 
-	return tmpDir, nil
+	return baseDir, nil
+}
+
+// ensureTrustedFolder adds the directory to copilot's trusted_folders config if not already present.
+func ensureTrustedFolder(dir string) error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	configPath := filepath.Join(homeDir, ".copilot", "config.json")
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+
+	var config map[string]any
+	if err := json.Unmarshal(data, &config); err != nil {
+		return err
+	}
+
+	// Check if already trusted
+	trusted, _ := config["trusted_folders"].([]any)
+	for _, f := range trusted {
+		if s, ok := f.(string); ok && s == dir {
+			return nil // already trusted
+		}
+	}
+
+	// Add to trusted folders
+	trusted = append(trusted, dir)
+	config["trusted_folders"] = trusted
+
+	out, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configPath, out, 0o644)
 }
 
 func buildMCPConfig(selfBinary, codespaceName, workdir string) string {
