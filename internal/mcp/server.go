@@ -595,9 +595,13 @@ func openTerminalTab(command, title string) error {
 	terminal := os.Getenv("COPILOT_TERMINAL")
 
 	if terminal == "" {
-		// Auto-detect: prefer cmux if available
-		if cmuxPath := findCmuxCLI(); cmuxPath != "" {
+		// Auto-detect: prefer cmux, then ghostty, then iterm2, then Terminal.app
+		if findCmuxCLI() != "" {
 			terminal = "cmux"
+		} else if _, err := os.Stat("/Applications/Ghostty.app"); err == nil {
+			terminal = "ghostty"
+		} else if _, err := os.Stat("/Applications/iTerm.app"); err == nil {
+			terminal = "iterm2"
 		} else {
 			terminal = "macos"
 		}
@@ -606,6 +610,10 @@ func openTerminalTab(command, title string) error {
 	switch terminal {
 	case "cmux":
 		return openCmuxTab(command, title)
+	case "ghostty":
+		return openGhosttyWindow(command)
+	case "iterm2":
+		return openITerm2Tab(command)
 	case "macos":
 		return openMacOSTab(command)
 	default:
@@ -667,5 +675,21 @@ func openMacOSTab(command string) error {
 	activate
 	do script "%s"
 end tell`, strings.ReplaceAll(command, `"`, `\"`))
+	return exec.Command("osascript", "-e", script).Run()
+}
+
+func openGhosttyWindow(command string) error {
+	return exec.Command("open", "-na", "Ghostty", "--args", "-e", command).Run()
+}
+
+func openITerm2Tab(command string) error {
+	escaped := strings.ReplaceAll(command, `"`, `\"`)
+	escaped = strings.ReplaceAll(escaped, `\`, `\\`)
+	script := fmt.Sprintf(`tell application "iTerm2"
+	activate
+	tell current window
+		create tab with default profile command "%s"
+	end tell
+end tell`, escaped)
 	return exec.Command("osascript", "-e", script).Run()
 }
