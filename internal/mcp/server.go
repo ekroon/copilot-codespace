@@ -37,7 +37,7 @@ func NewServer(sshClient *ssh.Client, codespaceName string) *server.MCPServer {
 func viewTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_view",
-		Description: "View a file or directory on the remote codespace. Returns file contents with line numbers.",
+		Description: "View a file or directory on the remote codespace. Returns file contents with line numbers. Replaces the local 'view' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -87,7 +87,7 @@ func viewHandler(c *ssh.Client) server.ToolHandlerFunc {
 func editTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_edit",
-		Description: "Edit a file on the remote codespace by replacing exactly one occurrence of old_str with new_str.",
+		Description: "Edit a file on the remote codespace by replacing exactly one occurrence of old_str with new_str. Replaces the local 'edit' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -136,7 +136,7 @@ func editHandler(c *ssh.Client) server.ToolHandlerFunc {
 func createTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_create",
-		Description: "Create a new file on the remote codespace with the given content. Parent directories are created automatically.",
+		Description: "Create a new file on the remote codespace with the given content. Parent directories are created automatically. Replaces the local 'create' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -177,7 +177,7 @@ func createHandler(c *ssh.Client) server.ToolHandlerFunc {
 func bashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_bash",
-		Description: "Execute a bash command on the remote codespace. Use mode 'async' for long-running or interactive commands (returns a shellId for use with remote_write_bash/remote_read_bash).",
+		Description: "Execute a bash command on the remote codespace. Use mode 'async' for long-running or interactive commands (returns a shellId for use with remote_write_bash/remote_read_bash). Replaces the local 'bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -255,7 +255,7 @@ func bashHandler(c *ssh.Client) server.ToolHandlerFunc {
 func writeBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_write_bash",
-		Description: "Send input to an async bash session on the remote codespace. Supports special keys: {enter}, {up}, {down}, {left}, {right}, {backspace}.",
+		Description: "Send input to an async bash session on the remote codespace. Supports special keys: {enter}, {up}, {down}, {left}, {right}, {backspace}. Replaces the local 'write_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -307,7 +307,7 @@ func writeBashHandler(c *ssh.Client) server.ToolHandlerFunc {
 func readBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_read_bash",
-		Description: "Read output from an async bash session on the remote codespace.",
+		Description: "Read output from an async bash session on the remote codespace. Replaces the local 'read_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -348,7 +348,7 @@ func readBashHandler(c *ssh.Client) server.ToolHandlerFunc {
 func stopBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_stop_bash",
-		Description: "Stop an async bash session on the remote codespace.",
+		Description: "Stop an async bash session on the remote codespace. Replaces the local 'stop_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -381,7 +381,7 @@ func stopBashHandler(c *ssh.Client) server.ToolHandlerFunc {
 func listBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_list_bash",
-		Description: "List active async bash sessions on the remote codespace.",
+		Description: "List active async bash sessions on the remote codespace. Replaces the local 'list_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{},
@@ -407,7 +407,7 @@ func listBashHandler(c *ssh.Client) server.ToolHandlerFunc {
 func grepTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_grep",
-		Description: "Search for a pattern in files on the remote codespace using ripgrep (with grep fallback).",
+		Description: "Search for a pattern in files on the remote codespace using ripgrep (with grep fallback). Replaces the local 'grep' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -455,7 +455,7 @@ func grepHandler(c *ssh.Client) server.ToolHandlerFunc {
 func globTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_glob",
-		Description: "Find files matching a glob pattern on the remote codespace.",
+		Description: "Find files matching a glob pattern on the remote codespace. Replaces the local 'glob' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
