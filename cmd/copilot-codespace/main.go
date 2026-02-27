@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -72,36 +70,12 @@ func runLauncher() error {
 		return fmt.Errorf("finding executable: %w", err)
 	}
 
-	// List codespaces
-	fmt.Println("Fetching codespaces...")
-	codespaces, err := listCodespaces()
+	// Use gh's built-in interactive codespace picker
+	selected, err := selectCodespace()
 	if err != nil {
 		return err
 	}
-	if len(codespaces) == 0 {
-		return fmt.Errorf("no codespaces found. Create one first with: gh codespace create")
-	}
-
-	// Display picker
-	fmt.Println()
-	fmt.Println("Available codespaces:")
-	fmt.Println("─────────────────────")
-	for i, cs := range codespaces {
-		icon := "🟢"
-		if cs.State != "Available" {
-			icon = "⏸️ "
-		}
-		fmt.Printf("  %2d) %s %s (%s) [%s]\n", i+1, icon, cs.DisplayName, cs.Repository, cs.State)
-	}
-
-	// Read selection
-	fmt.Println()
-	selection, err := promptSelection(len(codespaces))
-	if err != nil {
-		return err
-	}
-	selected := codespaces[selection]
-	fmt.Printf("\nSelected: %s\n", selected.Name)
+	fmt.Printf("Selected: %s (%s)\n", selected.DisplayName, selected.Repository)
 
 	// Start codespace if needed
 	if selected.State != "Available" {
@@ -156,35 +130,22 @@ func runLauncher() error {
 	return execCopilot(excludedTools, mcpConfig)
 }
 
-func listCodespaces() ([]codespace, error) {
-	out, err := exec.Command("gh", "codespace", "list",
-		"--json", "name,displayName,repository,state",
-		"--limit", "50",
-	).Output()
+// selectCodespace uses gh's built-in interactive picker to select a codespace.
+func selectCodespace() (codespace, error) {
+	cmd := exec.Command("gh", "codespace", "view",
+		"--json", "name,displayName,repository,state")
+	cmd.Stdin = os.Stdin
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("listing codespaces: %w", err)
+		return codespace{}, fmt.Errorf("selecting codespace: %w", err)
 	}
 
-	var codespaces []codespace
-	if err := json.Unmarshal(out, &codespaces); err != nil {
-		return nil, fmt.Errorf("parsing codespace list: %w", err)
+	var cs codespace
+	if err := json.Unmarshal(out, &cs); err != nil {
+		return codespace{}, fmt.Errorf("parsing codespace: %w", err)
 	}
-	return codespaces, nil
-}
-
-func promptSelection(max int) (int, error) {
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Printf("Select codespace [1-%d]: ", max)
-	input, err := reader.ReadString('\n')
-	if err != nil {
-		return 0, fmt.Errorf("reading input: %w", err)
-	}
-
-	n, err := strconv.Atoi(strings.TrimSpace(input))
-	if err != nil || n < 1 || n > max {
-		return 0, fmt.Errorf("invalid selection")
-	}
-	return n - 1, nil
+	return cs, nil
 }
 
 func startCodespace(name string) error {
