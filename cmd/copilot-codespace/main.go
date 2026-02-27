@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -130,22 +133,83 @@ func runLauncher() error {
 	return execCopilot(excludedTools, mcpConfig)
 }
 
-// selectCodespace uses gh's built-in interactive picker to select a codespace.
+// selectCodespace lets the user pick a codespace interactively.
+// Uses gum filter for fuzzy search if available, otherwise falls back to a numbered list.
 func selectCodespace() (codespace, error) {
-	cmd := exec.Command("gh", "codespace", "view",
-		"--json", "name,displayName,repository,state")
-	cmd.Stdin = os.Stdin
-	cmd.Stderr = os.Stderr
-	out, err := cmd.Output()
+	out, err := exec.Command("gh", "codespace", "list",
+		"--json", "name,displayName,repository,state",
+		"--limit", "50").Output()
 	if err != nil {
-		return codespace{}, fmt.Errorf("selecting codespace: %w", err)
+		return codespace{}, fmt.Errorf("listing codespaces: %w", err)
 	}
 
-	var cs codespace
-	if err := json.Unmarshal(out, &cs); err != nil {
-		return codespace{}, fmt.Errorf("parsing codespace: %w", err)
+	var codespaces []codespace
+	if err := json.Unmarshal(out, &codespaces); err != nil {
+		return codespace{}, fmt.Errorf("parsing codespace list: %w", err)
 	}
-	return cs, nil
+	if len(codespaces) == 0 {
+		return codespace{}, fmt.Errorf("no codespaces found")
+	}
+
+	// Sort: available first, then by display name
+	sort.Slice(codespaces, func(i, j int) bool {
+		if (codespaces[i].State == "Available") != (codespaces[j].State == "Available") {
+			return codespaces[i].State == "Available"
+		}
+		return codespaces[i].DisplayName < codespaces[j].DisplayName
+	})
+
+	// Build display lines: "name\ticon repo: display [state]"
+	lines := make([]string, len(codespaces))
+	for i, cs := range codespaces {
+		icon := "🟢"
+		if cs.State != "Available" {
+			icon = "⏸️"
+		}
+		lines[i] = fmt.Sprintf("%s\t%s %s: %s [%s]", cs.Name, icon, cs.Repository, cs.DisplayName, cs.State)
+	}
+
+	// Try gum filter for fuzzy interactive picker
+	if gumPath, err := exec.LookPath("gum"); err == nil {
+		displayLines := make([]string, len(lines))
+		for i, l := range lines {
+			// Show only the display part (after tab) in the picker
+			parts := strings.SplitN(l, "\t", 2)
+			displayLines[i] = parts[1]
+		}
+
+		cmd := exec.Command(gumPath, "filter", "--placeholder", "Choose codespace...")
+		cmd.Stdin = strings.NewReader(strings.Join(displayLines, "\n"))
+		cmd.Stderr = os.Stderr
+		selected, err := cmd.Output()
+		if err == nil {
+			choice := strings.TrimSpace(string(selected))
+			for i, dl := range displayLines {
+				if dl == choice {
+					return codespaces[i], nil
+				}
+			}
+		}
+		// gum failed (e.g., no TTY), fall through to numbered list
+	}
+
+	// Fallback: numbered list
+	for i, l := range lines {
+		parts := strings.SplitN(l, "\t", 2)
+		fmt.Printf("  %2d) %s\n", i+1, parts[1])
+	}
+
+	fmt.Printf("\nSelect [1-%d]: ", len(codespaces))
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		return codespace{}, fmt.Errorf("reading input: %w", err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(input))
+	if err != nil || n < 1 || n > len(codespaces) {
+		return codespace{}, fmt.Errorf("invalid selection")
+	}
+	return codespaces[n-1], nil
 }
 
 func startCodespace(name string) error {
