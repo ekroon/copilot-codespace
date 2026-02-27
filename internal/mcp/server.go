@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -12,7 +14,7 @@ import (
 )
 
 // NewServer creates and configures the MCP server with all remote tools.
-func NewServer(sshClient *ssh.Client) *server.MCPServer {
+func NewServer(sshClient *ssh.Client, codespaceName string) *server.MCPServer {
 	s := server.NewMCPServer("codespace-mcp", "0.1.0")
 
 	s.AddTool(viewTool(), viewHandler(sshClient))
@@ -25,6 +27,7 @@ func NewServer(sshClient *ssh.Client) *server.MCPServer {
 	s.AddTool(readBashTool(), readBashHandler(sshClient))
 	s.AddTool(stopBashTool(), stopBashHandler(sshClient))
 	s.AddTool(listBashTool(), listBashHandler(sshClient))
+	s.AddTool(openShellTool(), openShellHandler(codespaceName))
 
 	return s
 }
@@ -559,4 +562,110 @@ func toolError(text string) *mcpsdk.CallToolResult {
 			},
 		},
 	}
+}
+
+// --- open_shell ---
+
+func openShellTool() mcpsdk.Tool {
+	return mcpsdk.Tool{
+		Name:        "open_shell",
+		Description: "Open an interactive SSH shell to the codespace in a new terminal tab/window. Use this when the user asks for a shell, terminal, or SSH access to the codespace.",
+		InputSchema: mcpsdk.ToolInputSchema{
+			Type:       "object",
+			Properties: map[string]any{},
+		},
+	}
+}
+
+func openShellHandler(codespaceName string) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		sshCmd := fmt.Sprintf("gh codespace ssh -c %s", codespaceName)
+
+		if err := openTerminalTab(sshCmd, "codespace: "+codespaceName); err != nil {
+			return toolError(fmt.Sprintf("Failed to open shell: %v", err)), nil
+		}
+		return toolSuccess("Opened SSH shell to codespace in a new terminal tab."), nil
+	}
+}
+
+// openTerminalTab opens a new terminal tab with the given command.
+// Uses COPILOT_TERMINAL env var to determine the terminal to use.
+// Supported values: "cmux" (default if cmux is detected), "macos" (Terminal.app), or a custom command template.
+func openTerminalTab(command, title string) error {
+	terminal := os.Getenv("COPILOT_TERMINAL")
+
+	if terminal == "" {
+		// Auto-detect: prefer cmux if available
+		if cmuxPath := findCmuxCLI(); cmuxPath != "" {
+			terminal = "cmux"
+		} else {
+			terminal = "macos"
+		}
+	}
+
+	switch terminal {
+	case "cmux":
+		return openCmuxTab(command, title)
+	case "macos":
+		return openMacOSTab(command)
+	default:
+		// Custom command template: replace {} with the SSH command
+		customCmd := strings.ReplaceAll(terminal, "{}", command)
+		return exec.Command("sh", "-c", customCmd).Run()
+	}
+}
+
+func findCmuxCLI() string {
+	// Check common cmux CLI locations
+	paths := []string{
+		"/Applications/cmux.app/Contents/Resources/bin/cmux",
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+func openCmuxTab(command, title string) error {
+	cmuxCLI := findCmuxCLI()
+	if cmuxCLI == "" {
+		return fmt.Errorf("cmux CLI not found")
+	}
+
+	// Create a new terminal tab (surface) in the current workspace
+	out, err := exec.Command(cmuxCLI, "new-surface", "--type", "terminal").Output()
+	if err != nil {
+		return fmt.Errorf("cmux new-surface: %w", err)
+	}
+
+	// Parse surface ref (e.g., "OK surface:18 pane:5 workspace:5")
+	var surfaceRef string
+	for _, field := range strings.Fields(string(out)) {
+		if strings.HasPrefix(field, "surface:") {
+			surfaceRef = field
+			break
+		}
+	}
+	if surfaceRef == "" {
+		return nil
+	}
+
+	// Send the command and press Enter
+	exec.Command(cmuxCLI, "send", "--surface", surfaceRef, command).Run()
+	exec.Command(cmuxCLI, "send-key", "--surface", surfaceRef, "Enter").Run()
+
+	// Rename the tab
+	exec.Command(cmuxCLI, "tab-action", "--action", "rename",
+		"--tab", surfaceRef, "--title", title).Run()
+	return nil
+}
+
+func openMacOSTab(command string) error {
+	script := fmt.Sprintf(`tell application "Terminal"
+	activate
+	do script "%s"
+end tell`, strings.ReplaceAll(command, `"`, `\"`))
+	return exec.Command("osascript", "-e", script).Run()
 }
