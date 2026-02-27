@@ -206,9 +206,17 @@ func (c *Client) Glob(ctx context.Context, pattern, path string) (string, error)
 
 const tmuxPrefix = "copilot-"
 
+// misePATH is prepended to PATH for commands that need mise-installed tools.
+const misePATH = `PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"`
+
 // tmuxSessionName returns the prefixed tmux session name.
 func tmuxSessionName(sessionID string) string {
 	return tmuxPrefix + sessionID
+}
+
+// execTmux runs a tmux command with mise shims on the PATH.
+func (c *Client) execTmux(ctx context.Context, tmuxCmd string) (string, string, int, error) {
+	return c.Exec(ctx, misePATH+" && "+tmuxCmd)
 }
 
 // StartSession creates a named tmux session running the given command on the codespace.
@@ -216,13 +224,8 @@ func tmuxSessionName(sessionID string) string {
 func (c *Client) StartSession(ctx context.Context, sessionID, command string) error {
 	name := tmuxSessionName(sessionID)
 
-	// Ensure tmux is available, install if missing (Debian-based devcontainers)
-	_, _, exitCode, _ := c.Exec(ctx, "command -v tmux")
-	if exitCode != 0 {
-		c.Exec(ctx, "sudo apt-get update -qq && sudo apt-get install -y -qq tmux 2>/dev/null")
-		if _, _, ec, _ := c.Exec(ctx, "command -v tmux"); ec != 0 {
-			return fmt.Errorf("tmux is not available on the codespace and could not be installed")
-		}
+	if err := c.ensureTmux(ctx); err != nil {
+		return err
 	}
 
 	// Create session with remain-on-exit so we can read output after command finishes
@@ -230,12 +233,37 @@ func (c *Client) StartSession(ctx context.Context, sessionID, command string) er
 		"tmux new-session -d -s %s -x 200 -y 50 %s && tmux set-option -t %s remain-on-exit on",
 		shellQuote(name), shellQuote(command), shellQuote(name))
 
-	_, stderr, exitCode, err := c.Exec(ctx, cmd)
+	_, stderr, exitCode, err := c.execTmux(ctx, cmd)
 	if err != nil {
 		return fmt.Errorf("start session: %w", err)
 	}
 	if exitCode != 0 {
 		return fmt.Errorf("start session failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// ensureTmux checks if tmux is available on the codespace and installs it via mise if not.
+func (c *Client) ensureTmux(ctx context.Context) error {
+	if _, _, ec, _ := c.execTmux(ctx, "command -v tmux"); ec == 0 {
+		return nil
+	}
+
+	fmt.Fprintln(os.Stderr, "codespace-mcp: tmux not found, installing via mise...")
+
+	// Install mise if not available, then install tmux
+	installScript := misePATH + ` && (command -v mise >/dev/null 2>&1 || curl -fsSL https://mise.jdx.dev/install.sh | sh) && mise use -g tmux`
+	_, stderr, exitCode, err := c.Exec(ctx, installScript)
+	if err != nil {
+		return fmt.Errorf("installing tmux: %w", err)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("failed to install tmux via mise (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+	}
+
+	// Verify tmux is now available
+	if _, _, ec, _ := c.execTmux(ctx, "command -v tmux"); ec != 0 {
+		return fmt.Errorf("tmux still not available after mise install")
 	}
 	return nil
 }
@@ -292,15 +320,13 @@ func (c *Client) WriteSession(ctx context.Context, sessionID, input string) erro
 	for _, seg := range segments {
 		var cmd string
 		if strings.HasPrefix(seg, "\x00") {
-			// Special key
 			tmuxKey := seg[1:]
 			cmd = fmt.Sprintf("tmux send-keys -t %s %s", shellQuote(name), tmuxKey)
 		} else {
-			// Literal text
 			cmd = fmt.Sprintf("tmux send-keys -t %s %s", shellQuote(name), shellQuote(seg))
 		}
 
-		_, stderr, exitCode, err := c.Exec(ctx, cmd)
+		_, stderr, exitCode, err := c.execTmux(ctx, cmd)
 		if err != nil {
 			return fmt.Errorf("write session: %w", err)
 		}
@@ -318,12 +344,12 @@ func (c *Client) ReadSession(ctx context.Context, sessionID string) (string, err
 
 	// Check if session exists
 	checkCmd := fmt.Sprintf("tmux has-session -t %s 2>/dev/null", shellQuote(name))
-	if _, _, ec, _ := c.Exec(ctx, checkCmd); ec != 0 {
+	if _, _, ec, _ := c.execTmux(ctx, checkCmd); ec != 0 {
 		return "", fmt.Errorf("session %q does not exist (command may have exited and been cleaned up)", sessionID)
 	}
 
 	cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -100", shellQuote(name))
-	stdout, stderr, exitCode, err := c.Exec(ctx, cmd)
+	stdout, stderr, exitCode, err := c.execTmux(ctx, cmd)
 	if err != nil {
 		return "", fmt.Errorf("read session: %w", err)
 	}
@@ -333,7 +359,7 @@ func (c *Client) ReadSession(ctx context.Context, sessionID string) (string, err
 
 	// Check if the pane is dead (command exited)
 	statusCmd := fmt.Sprintf("tmux list-panes -t %s -F '#{pane_dead} #{pane_dead_status}' 2>/dev/null", shellQuote(name))
-	statusOut, _, _, _ := c.Exec(ctx, statusCmd)
+	statusOut, _, _, _ := c.execTmux(ctx, statusCmd)
 	if strings.HasPrefix(strings.TrimSpace(statusOut), "1") {
 		stdout += "\n[session exited]"
 	}
@@ -346,7 +372,7 @@ func (c *Client) StopSession(ctx context.Context, sessionID string) error {
 	name := tmuxSessionName(sessionID)
 	cmd := fmt.Sprintf("tmux kill-session -t %s", shellQuote(name))
 
-	_, stderr, exitCode, err := c.Exec(ctx, cmd)
+	_, stderr, exitCode, err := c.execTmux(ctx, cmd)
 	if err != nil {
 		return fmt.Errorf("stop session: %w", err)
 	}
@@ -360,7 +386,7 @@ func (c *Client) StopSession(ctx context.Context, sessionID string) error {
 func (c *Client) ListSessions(ctx context.Context) (string, error) {
 	cmd := "tmux list-sessions -F '#{session_name} #{session_created} #{session_activity}' 2>/dev/null | grep '^" + tmuxPrefix + "'"
 
-	stdout, _, exitCode, err := c.Exec(ctx, cmd)
+	stdout, _, exitCode, err := c.execTmux(ctx, cmd)
 	if err != nil {
 		return "", fmt.Errorf("list sessions: %w", err)
 	}
