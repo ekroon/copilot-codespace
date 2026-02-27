@@ -157,14 +157,14 @@ func (c *Client) ViewFile(ctx context.Context, path string, viewRange []int) (st
 	var cmd string
 	if len(viewRange) == 2 {
 		if viewRange[1] == -1 {
-			cmd = fmt.Sprintf("sed -n '%dp,$p' %s | nl -ba -nln -w4 -v%d",
-				viewRange[0], shellQuote(path), viewRange[0])
+			cmd = fmt.Sprintf("awk 'NR>=%d {print NR\". \"$0}' %s",
+				viewRange[0], shellQuote(path))
 		} else {
-			cmd = fmt.Sprintf("sed -n '%d,%dp' %s | nl -ba -nln -w4 -v%d",
-				viewRange[0], viewRange[1], shellQuote(path), viewRange[0])
+			cmd = fmt.Sprintf("awk 'NR>=%d && NR<=%d {print NR\". \"$0}' %s",
+				viewRange[0], viewRange[1], shellQuote(path))
 		}
 	} else {
-		cmd = fmt.Sprintf("cat -n %s", shellQuote(path))
+		cmd = fmt.Sprintf("awk '{print NR\". \"$0}' %s", shellQuote(path))
 	}
 
 	stdout, stderr, exitCode, err := c.Exec(ctx, cmd)
@@ -179,37 +179,42 @@ func (c *Client) ViewFile(ctx context.Context, path string, viewRange []int) (st
 
 // EditFile replaces exactly one occurrence of oldStr with newStr in the file.
 func (c *Client) EditFile(ctx context.Context, path, oldStr, newStr string) error {
-	pathB64 := base64.StdEncoding.EncodeToString([]byte(path))
-	oldB64 := base64.StdEncoding.EncodeToString([]byte(oldStr))
-	newB64 := base64.StdEncoding.EncodeToString([]byte(newStr))
-
-	// All user inputs passed via base64 to prevent injection
-	script := fmt.Sprintf(`python3 -c "
-import base64, sys
-path = base64.b64decode('%s').decode()
-old = base64.b64decode('%s').decode()
-new = base64.b64decode('%s').decode()
-content = open(path).read()
-count = content.count(old)
-if count == 0:
-    print('ERROR: old_str not found in file', file=sys.stderr)
-    sys.exit(1)
-if count > 1:
-    print(f'ERROR: old_str found {count} times, must be unique', file=sys.stderr)
-    sys.exit(1)
-content = content.replace(old, new, 1)
-open(path, 'w').write(content)
-print('OK')
-"`, pathB64, oldB64, newB64)
-
-	stdout, stderr, exitCode, err := c.Exec(ctx, script)
+	// Read file content via SSH
+	stdout, stderr, exitCode, err := c.Exec(ctx, fmt.Sprintf("base64 < %s", shellQuote(path)))
 	if err != nil {
-		return fmt.Errorf("edit file: %w", err)
+		return fmt.Errorf("edit file (read): %w", err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("edit file failed: %s", strings.TrimSpace(stderr))
+		return fmt.Errorf("edit file (read) failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
 	}
-	_ = stdout
+
+	content, err := base64.StdEncoding.DecodeString(strings.TrimSpace(stdout))
+	if err != nil {
+		return fmt.Errorf("edit file (decode): %w", err)
+	}
+
+	// Do the replacement in Go
+	contentStr := string(content)
+	count := strings.Count(contentStr, oldStr)
+	if count == 0 {
+		return fmt.Errorf("old_str not found in file")
+	}
+	if count > 1 {
+		return fmt.Errorf("old_str found %d times, must be unique", count)
+	}
+
+	newContent := strings.Replace(contentStr, oldStr, newStr, 1)
+
+	// Write back via SSH
+	b64 := base64.StdEncoding.EncodeToString([]byte(newContent))
+	cmd := fmt.Sprintf("echo %s | base64 -d > %s", shellQuote(b64), shellQuote(path))
+	_, stderr, exitCode, err = c.Exec(ctx, cmd)
+	if err != nil {
+		return fmt.Errorf("edit file (write): %w", err)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("edit file (write) failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+	}
 	return nil
 }
 
@@ -245,7 +250,7 @@ func (c *Client) RunBash(ctx context.Context, command string) (stdout string, st
 // Grep searches for a pattern in files on the codespace.
 func (c *Client) Grep(ctx context.Context, pattern, path, globPattern string) (string, error) {
 	var args []string
-	args = append(args, "rg", "--color=never")
+	args = append(args, "rg", "--color=never", "-n")
 
 	if globPattern != "" {
 		args = append(args, "--glob", shellQuote(globPattern))
@@ -253,20 +258,17 @@ func (c *Client) Grep(ctx context.Context, pattern, path, globPattern string) (s
 
 	args = append(args, shellQuote(pattern))
 
-	if path != "" {
-		args = append(args, shellQuote(path))
+	searchPath := path
+	if searchPath == "" {
+		searchPath = "."
 	}
+	args = append(args, shellQuote(searchPath))
 
 	cmd := strings.Join(args, " ")
 
 	// Fallback to grep if rg is not available
 	cmd = fmt.Sprintf("(%s) 2>/dev/null || grep -rn %s %s",
-		cmd, shellQuote(pattern), func() string {
-			if path != "" {
-				return shellQuote(path)
-			}
-			return "."
-		}())
+		cmd, shellQuote(pattern), shellQuote(searchPath))
 
 	stdout, _, exitCode, err := c.Exec(ctx, cmd)
 	if err != nil {
@@ -280,6 +282,7 @@ func (c *Client) Grep(ctx context.Context, pattern, path, globPattern string) (s
 }
 
 // Glob finds files matching a glob pattern on the codespace.
+// Supports standard glob patterns like **/*.go, *.ts, src/**/*.test.js.
 func (c *Client) Glob(ctx context.Context, pattern, path string) (string, error) {
 	searchPath := path
 	if searchPath == "" {
@@ -289,8 +292,11 @@ func (c *Client) Glob(ctx context.Context, pattern, path string) (string, error)
 		}
 	}
 
-	cmd := fmt.Sprintf("find %s -path %s -not -path '*/\\.git/*' 2>/dev/null | head -200",
-		shellQuote(searchPath), shellQuote(pattern))
+	// Use fd if available (supports glob natively), fallback to find with -name
+	// Extract the filename pattern from globs like **/*.go → *.go for find -name
+	cmd := fmt.Sprintf(
+		"(cd %s && fd --type f --glob %s --exclude .git 2>/dev/null || find . -name %s -not -path '*/.git/*' 2>/dev/null) | head -200",
+		shellQuote(searchPath), shellQuote(pattern), shellQuote(globToFindName(pattern)))
 
 	stdout, _, exitCode, err := c.Exec(ctx, cmd)
 	if err != nil {
@@ -300,6 +306,14 @@ func (c *Client) Glob(ctx context.Context, pattern, path string) (string, error)
 		return "", fmt.Errorf("glob failed with exit code %d", exitCode)
 	}
 	return stdout, nil
+}
+
+// globToFindName extracts a filename pattern from a glob for use with find -name.
+// e.g., "**/*.go" → "*.go", "src/**/*.test.js" → "*.test.js", "*.ts" → "*.ts"
+func globToFindName(pattern string) string {
+	// Take the last path component
+	parts := strings.Split(pattern, "/")
+	return parts[len(parts)-1]
 }
 
 const tmuxPrefix = "copilot-"
