@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# copilot-codespace: Launch Copilot CLI with remote codespace tools
+# Disables built-in file/bash tools and replaces them with SSH-based remote equivalents.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MCP_BINARY="${SCRIPT_DIR}/../codespace-mcp"
+
+# Build the MCP server if not present
+if [[ ! -x "$MCP_BINARY" ]]; then
+    echo "Building codespace-mcp..."
+    (cd "${SCRIPT_DIR}/.." && go build -o codespace-mcp ./cmd/codespace-mcp)
+fi
+
+# List codespaces and let user pick one
+echo "Fetching codespaces..."
+CODESPACES_JSON=$(gh codespace list --json name,displayName,repository,state --limit 50 2>/dev/null)
+
+if [[ -z "$CODESPACES_JSON" ]] || [[ "$CODESPACES_JSON" == "[]" ]]; then
+    echo "No codespaces found. Create one first with: gh codespace create"
+    exit 1
+fi
+
+# Display codespaces with index numbers
+echo ""
+echo "Available codespaces:"
+echo "─────────────────────"
+NAMES=()
+STATES=()
+while IFS= read -r line; do
+    idx=$(echo "$line" | jq -r '.idx')
+    name=$(echo "$line" | jq -r '.name')
+    display=$(echo "$line" | jq -r '.displayName')
+    repo=$(echo "$line" | jq -r '.repository')
+    state=$(echo "$line" | jq -r '.state')
+
+    NAMES+=("$name")
+    STATES+=("$state")
+
+    state_icon="🟢"
+    [[ "$state" != "Available" ]] && state_icon="⏸️ "
+
+    printf "  %2s) %s %s (%s) [%s]\n" "$idx" "$state_icon" "$display" "$repo" "$state"
+done < <(echo "$CODESPACES_JSON" | jq -c '. | to_entries[] | {idx: (.key + 1), name: .value.name, displayName: .value.displayName, repository: .value.repository, state: .value.state}')
+
+echo ""
+read -rp "Select codespace [1-${#NAMES[@]}]: " SELECTION
+
+if [[ -z "$SELECTION" ]] || [[ "$SELECTION" -lt 1 ]] || [[ "$SELECTION" -gt ${#NAMES[@]} ]]; then
+    echo "Invalid selection."
+    exit 1
+fi
+
+SELECTED_IDX=$((SELECTION - 1))
+CODESPACE_NAME="${NAMES[$SELECTED_IDX]}"
+CODESPACE_STATE="${STATES[$SELECTED_IDX]}"
+
+echo ""
+echo "Selected: $CODESPACE_NAME"
+
+# Start codespace if it's not running
+if [[ "$CODESPACE_STATE" != "Available" ]]; then
+    echo "Starting codespace (this may take a moment)..."
+    gh codespace start -c "$CODESPACE_NAME" 2>/dev/null
+    echo "Waiting for SSH readiness..."
+    sleep 3
+
+    # Poll until SSH works
+    for i in $(seq 1 30); do
+        if gh codespace ssh -c "$CODESPACE_NAME" -- "echo ready" &>/dev/null; then
+            echo "Codespace is ready!"
+            break
+        fi
+        if [[ $i -eq 30 ]]; then
+            echo "Timed out waiting for codespace SSH. Try again later."
+            exit 1
+        fi
+        sleep 2
+    done
+fi
+
+# Detect workspace directory on codespace
+WORKDIR=$(gh codespace ssh -c "$CODESPACE_NAME" -- 'ls -d /workspaces/*/ 2>/dev/null | head -1' 2>/dev/null || echo "/workspaces")
+WORKDIR="${WORKDIR%/}"
+echo "Workspace: $WORKDIR"
+
+# Fetch remote instruction files so copilot can discover them
+INSTRUCTIONS_DIR=$(mktemp -d)
+cleanup() { rm -rf "$INSTRUCTIONS_DIR"; }
+trap cleanup EXIT
+
+echo "Fetching instruction files from codespace..."
+# Fetch each instruction file type, preserving directory structure
+for pattern in \
+    ".github/copilot-instructions.md" \
+    "AGENTS.md" \
+    "CLAUDE.md" \
+    "GEMINI.md"; do
+    REMOTE_PATH="${WORKDIR}/${pattern}"
+    if gh codespace ssh -c "$CODESPACE_NAME" -- "test -f ${REMOTE_PATH}" 2>/dev/null; then
+        LOCAL_DIR="${INSTRUCTIONS_DIR}/$(dirname "$pattern")"
+        mkdir -p "$LOCAL_DIR"
+        gh codespace ssh -c "$CODESPACE_NAME" -- "cat ${REMOTE_PATH}" > "${INSTRUCTIONS_DIR}/${pattern}" 2>/dev/null
+        echo "  ✓ ${pattern}"
+    fi
+done
+
+# Fetch scoped instruction files (.github/instructions/**/*.instructions.md)
+SCOPED_FILES=$(gh codespace ssh -c "$CODESPACE_NAME" -- "find ${WORKDIR}/.github/instructions -name '*.instructions.md' 2>/dev/null" 2>/dev/null || true)
+if [[ -n "$SCOPED_FILES" ]]; then
+    while IFS= read -r remote_file; do
+        rel_path="${remote_file#"${WORKDIR}"/}"
+        local_dir="${INSTRUCTIONS_DIR}/$(dirname "$rel_path")"
+        mkdir -p "$local_dir"
+        gh codespace ssh -c "$CODESPACE_NAME" -- "cat ${remote_file}" > "${INSTRUCTIONS_DIR}/${rel_path}" 2>/dev/null
+        echo "  ✓ ${rel_path}"
+    done <<< "$SCOPED_FILES"
+fi
+
+# Init as git repo and cd so copilot loads instruction files from here
+git -C "$INSTRUCTIONS_DIR" init -q 2>/dev/null
+cd "$INSTRUCTIONS_DIR"
+
+# Build MCP config JSON safely using jq
+MCP_CONFIG=$(jq -n \
+    --arg cmd "$MCP_BINARY" \
+    --arg name "$CODESPACE_NAME" \
+    --arg dir "$WORKDIR" \
+    '{mcpServers: {codespace: {type: "local", command: $cmd, args: ["mcp"], env: {CODESPACE_NAME: $name, CODESPACE_WORKDIR: $dir}, tools: ["*"]}}}'
+)
+
+# Tools to exclude (built-in local tools replaced by remote MCP equivalents)
+EXCLUDED_TOOLS=(
+    "edit"
+    "create"
+    "bash"
+    "write_bash"
+    "read_bash"
+    "stop_bash"
+    "list_bash"
+    "view"
+    "grep"
+    "glob"
+    "task"
+)
+
+echo ""
+echo "Launching Copilot CLI with remote codespace tools..."
+echo "  Codespace: $CODESPACE_NAME"
+echo "  Workspace: $WORKDIR"
+echo "  Excluded:  ${#EXCLUDED_TOOLS[@]} local tools"
+echo ""
+
+# Launch copilot with remote tools only (cwd is the instructions dir)
+exec copilot \
+    --excluded-tools "${EXCLUDED_TOOLS[@]}" \
+    --additional-mcp-config "$MCP_CONFIG" \
+    "$@"
