@@ -32,8 +32,18 @@ func main() {
 		return
 	}
 
-	// If first arg is "shell", SSH into the codespace (used as $SHELL for ! escape)
+	// If first arg is "shell", or -c with CODESPACE_NAME set (invoked as $SHELL by copilot),
+	// SSH into the codespace
 	if len(os.Args) > 1 && os.Args[1] == "shell" {
+		runShell()
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "-c" && os.Getenv("CODESPACE_NAME") != "" {
+		runShell()
+		return
+	}
+	// No args with CODESPACE_NAME set = interactive shell on codespace
+	if len(os.Args) == 1 && os.Getenv("CODESPACE_NAME") != "" {
 		runShell()
 		return
 	}
@@ -352,14 +362,17 @@ func runShell() {
 		os.Exit(1)
 	}
 
-	// If called as "shell -c <command>", run the command via SSH
-	// Otherwise, open an interactive SSH session
-	if len(os.Args) >= 4 && os.Args[2] == "-c" {
-		cmd := strings.Join(os.Args[3:], " ")
-		syscall.Exec(ghPath, []string{"gh", "codespace", "ssh", "-c", codespaceName, "--", cmd}, os.Environ())
-	} else {
-		syscall.Exec(ghPath, []string{"gh", "codespace", "ssh", "-c", codespaceName}, os.Environ())
+	// Find -c flag and command (handles both "shell -c cmd" and "-c cmd")
+	for i, arg := range os.Args[1:] {
+		if arg == "-c" && i+2 < len(os.Args) {
+			cmd := strings.Join(os.Args[i+2:], " ")
+			syscall.Exec(ghPath, []string{"gh", "codespace", "ssh", "-c", codespaceName, "--", cmd}, os.Environ())
+			return
+		}
 	}
+
+	// Interactive SSH session
+	syscall.Exec(ghPath, []string{"gh", "codespace", "ssh", "-c", codespaceName}, os.Environ())
 }
 
 func buildMCPConfig(selfBinary, codespaceName, workdir string) string {
