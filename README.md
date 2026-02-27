@@ -18,21 +18,28 @@ A single Go binary (`copilot-codespace`) serves two roles:
 
 ## Prerequisites
 
-- Go 1.21+
 - `gh` CLI authenticated with `codespace` scope
 - At least one GitHub Codespace
+- [Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) installed
+
+## Installation
+
+```bash
+# With mise (recommended)
+mise use -g github:ekroon/copilot-codespace
+
+# Or build from source
+go build -o copilot-codespace ./cmd/copilot-codespace
+```
 
 ## Quick start
 
 ```bash
-# Build
-go build -o copilot-codespace ./cmd/copilot-codespace
-
 # Run (interactive codespace picker → copilot with remote tools)
-./copilot-codespace
+copilot-codespace
 
 # Pass extra copilot flags
-./copilot-codespace --model claude-sonnet-4.5
+copilot-codespace --model claude-sonnet-4.5
 ```
 
 ## Known limitations
