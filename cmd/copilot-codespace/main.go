@@ -116,10 +116,11 @@ func runLauncher() error {
 	// Build MCP config — points to this same binary with "mcp" subcommand
 	mcpConfig := buildMCPConfig(self, selected.Name, workdir)
 
-	// Excluded tools
+	// Excluded tools — only local file/shell tools that have remote equivalents
+	// Keep task (sub-agents), web_fetch, ask_user, sql, etc.
 	excludedTools := []string{
 		"edit", "create", "bash", "write_bash", "read_bash",
-		"stop_bash", "list_bash", "view", "grep", "glob", "task",
+		"stop_bash", "list_bash", "view", "grep", "glob",
 	}
 
 	fmt.Printf("\nLaunching Copilot CLI with remote codespace tools...\n")
