@@ -32,22 +32,6 @@ func main() {
 		return
 	}
 
-	// If first arg is "shell", or -c with CODESPACE_NAME set (invoked as $SHELL by copilot),
-	// SSH into the codespace
-	if len(os.Args) > 1 && os.Args[1] == "shell" {
-		runShell()
-		return
-	}
-	if len(os.Args) > 1 && os.Args[1] == "-c" && os.Getenv("CODESPACE_NAME") != "" {
-		runShell()
-		return
-	}
-	// No args with CODESPACE_NAME set = interactive shell on codespace
-	if len(os.Args) == 1 && os.Getenv("CODESPACE_NAME") != "" {
-		runShell()
-		return
-	}
-
 	// Otherwise, run as interactive launcher
 	if err := runLauncher(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -349,32 +333,6 @@ func ensureTrustedFolder(dir string) error {
 	return os.WriteFile(configPath, out, 0o644)
 }
 
-func runShell() {
-	codespaceName := os.Getenv("CODESPACE_NAME")
-	if codespaceName == "" {
-		fmt.Fprintln(os.Stderr, "CODESPACE_NAME not set")
-		os.Exit(1)
-	}
-
-	ghPath, err := exec.LookPath("gh")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "gh not found in PATH")
-		os.Exit(1)
-	}
-
-	// Find -c flag and command (handles both "shell -c cmd" and "-c cmd")
-	for i, arg := range os.Args[1:] {
-		if arg == "-c" && i+2 < len(os.Args) {
-			cmd := strings.Join(os.Args[i+2:], " ")
-			syscall.Exec(ghPath, []string{"gh", "codespace", "ssh", "-c", codespaceName, "--", cmd}, os.Environ())
-			return
-		}
-	}
-
-	// Interactive SSH session
-	syscall.Exec(ghPath, []string{"gh", "codespace", "ssh", "-c", codespaceName}, os.Environ())
-}
-
 func buildMCPConfig(selfBinary, codespaceName, workdir string) string {
 	config := map[string]any{
 		"mcpServers": map[string]any{
@@ -408,22 +366,5 @@ func execCopilot(excludedTools []string, mcpConfig string) error {
 	// Pass through any extra args from the command line
 	args = append(args, os.Args[1:]...)
 
-	// Set SHELL to our own binary's "shell" subcommand so ! escape SSHs into codespace
-	self, _ := os.Executable()
-	env := os.Environ()
-	env = setEnv(env, "SHELL", self)
-
-	return syscall.Exec(copilotPath, args, env)
-}
-
-// setEnv sets or replaces an environment variable in a list.
-func setEnv(env []string, key, value string) []string {
-	prefix := key + "="
-	for i, e := range env {
-		if strings.HasPrefix(e, prefix) {
-			env[i] = prefix + value
-			return env
-		}
-	}
-	return append(env, prefix+value)
+	return syscall.Exec(copilotPath, args, os.Environ())
 }

@@ -35,6 +35,10 @@ go build -o copilot-codespace ./cmd/copilot-codespace
 ./copilot-codespace --model claude-sonnet-4.5
 ```
 
+## Known limitations
+
+- **`!` shell escape runs locally** — Copilot's built-in `!` shell escape mode uses its own internal shell execution and ignores `--excluded-tools` and `$SHELL`. Commands typed via `!` will run on your local machine, not on the codespace. Use the `remote_bash` tool through the agent instead.
+
 ## Environment variables
 
 | Variable | Description | Set by |
