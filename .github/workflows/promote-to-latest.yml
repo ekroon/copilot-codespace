@@ -63,24 +63,11 @@ jobs:
         run: |
           VERSION="${{ steps.resolve.outputs.version }}"
 
-          # Create semver release for mise
+          # Create semver release for mise and mark as latest
           gh release create "${VERSION}" \
             --title "${VERSION}" \
+            --latest \
             --notes "Build from commit ${{ steps.resolve.outputs.sha }}
-
-          ## Install with mise
-
-          \`\`\`sh
-          mise use -g github:ekroon/copilot-codespace
-          \`\`\`" \
-            ./artifacts/copilot-codespace-*
-
-          # Keep 'latest' tag as an alias
-          gh release delete latest --yes 2>/dev/null || true
-          git push origin :refs/tags/latest 2>/dev/null || true
-          gh release create latest \
-            --title "Latest (${VERSION})" \
-            --notes "Latest build from commit ${{ steps.resolve.outputs.sha }} (${VERSION})
 
           ## Install with mise
 
