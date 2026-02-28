@@ -8,7 +8,18 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
   release:
+    needs: [check]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -48,6 +59,21 @@ jobs:
         with:
           merge-multiple: true
 
+      - name: Check signoff status
+        id: signoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          STATUS=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/status" \
+            --jq '.statuses[] | select(.context == "signoff/integration") | .state' 2>/dev/null || echo "")
+          if [[ "$STATUS" == "success" ]]; then
+            echo "signed_off=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed_off=false" >> "$GITHUB_OUTPUT"
+            echo "⏸️  No integration signoff — skipping latest tag update"
+            echo "   Run locally: ./scripts/integration-test.sh && gh signoff integration"
+          fi
+
       - name: Create pre-release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,7 +93,13 @@ jobs:
             --prerelease \
             copilot-codespace-*
 
-          # Update the 'latest' tag so mise can resolve @latest
+      - name: Update the 'latest' tag
+        if: steps.signoff.outputs.signed_off == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
           gh release delete latest --yes 2>/dev/null || true
           git push origin :refs/tags/latest 2>/dev/null || true
           gh release create latest \

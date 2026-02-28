@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Build (cross-platform)
+        run: |
+          for pair in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+            GOOS="${pair%/*}" GOARCH="${pair#*/}"
+            echo "Building for $GOOS/$GOARCH"
+            GOOS="$GOOS" GOARCH="$GOARCH" go build ./...
+          done

@@ -14,7 +14,7 @@ import (
 )
 
 // NewServer creates and configures the MCP server with all remote tools.
-func NewServer(sshClient *ssh.Client, codespaceName string) *server.MCPServer {
+func NewServer(sshClient ssh.Executor, codespaceName string) *server.MCPServer {
 	s := server.NewMCPServer("codespace-mcp", "0.1.0")
 
 	s.AddTool(viewTool(), viewHandler(sshClient))
@@ -56,7 +56,7 @@ func viewTool() mcpsdk.Tool {
 	}
 }
 
-func viewHandler(c *ssh.Client) server.ToolHandlerFunc {
+func viewHandler(c ssh.Executor) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		path, err := requiredString(req, "path")
 		if err != nil {
@@ -109,7 +109,7 @@ func editTool() mcpsdk.Tool {
 	}
 }
 
-func editHandler(c *ssh.Client) server.ToolHandlerFunc {
+func editHandler(c ssh.Executor) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		path, err := requiredString(req, "path")
 		if err != nil {
@@ -154,7 +154,7 @@ func createTool() mcpsdk.Tool {
 	}
 }
 
-func createHandler(c *ssh.Client) server.ToolHandlerFunc {
+func createHandler(c ssh.Executor) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		path, err := requiredString(req, "path")
 		if err != nil {
@@ -204,7 +204,7 @@ func bashTool() mcpsdk.Tool {
 	}
 }
 
-func bashHandler(c *ssh.Client) server.ToolHandlerFunc {
+func bashHandler(c ssh.Executor) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		command, err := requiredString(req, "command")
 		if err != nil {
@@ -277,7 +277,7 @@ func writeBashTool() mcpsdk.Tool {
 	}
 }
 
-func writeBashHandler(c *ssh.Client) server.ToolHandlerFunc {
+func writeBashHandler(c ssh.Executor) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		shellId, err := requiredString(req, "shellId")
 		if err != nil {
@@ -325,7 +325,7 @@ func readBashTool() mcpsdk.Tool {
 	}
 }
 
-func readBashHandler(c *ssh.Client) server.ToolHandlerFunc {
+func readBashHandler(c ssh.Executor) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		shellId, err := requiredString(req, "shellId")
 		if err != nil {
@@ -362,7 +362,7 @@ func stopBashTool() mcpsdk.Tool {
 	}
 }
 
-func stopBashHandler(c *ssh.Client) server.ToolHandlerFunc {
+func stopBashHandler(c ssh.Executor) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		shellId, err := requiredString(req, "shellId")
 		if err != nil {
@@ -389,7 +389,7 @@ func listBashTool() mcpsdk.Tool {
 	}
 }
 
-func listBashHandler(c *ssh.Client) server.ToolHandlerFunc {
+func listBashHandler(c ssh.Executor) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		result, err := c.ListSessions(ctx)
 		if err != nil {
@@ -429,7 +429,7 @@ func grepTool() mcpsdk.Tool {
 	}
 }
 
-func grepHandler(c *ssh.Client) server.ToolHandlerFunc {
+func grepHandler(c ssh.Executor) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		pattern, err := requiredString(req, "pattern")
 		if err != nil {
@@ -473,7 +473,7 @@ func globTool() mcpsdk.Tool {
 	}
 }
 
-func globHandler(c *ssh.Client) server.ToolHandlerFunc {
+func globHandler(c ssh.Executor) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		pattern, err := requiredString(req, "pattern")
 		if err != nil {

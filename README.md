@@ -59,6 +59,33 @@ When this flag is set, `!` commands execute on the codespace instead of locally.
 - Relies on a heuristic to detect `!` spawns (`shell: true` + `stdio: "pipe"`)
 - Requires `node` (v24+) in PATH
 
+## Development
+
+### Running tests
+
+```bash
+go test -race ./...
+```
+
+### Integration testing & signoff
+
+Integration tests require a real codespace and `gh` CLI authentication. They run locally, not in CI.
+
+```bash
+# One-time setup: install gh-signoff
+./scripts/setup-signoff.sh
+
+# Run integration tests
+./scripts/integration-test.sh
+
+# Sign off on the current commit (sets a GitHub commit status)
+gh signoff integration
+```
+
+### Release flow
+
+Every push to `main` triggers CI (vet, test, cross-platform build). If CI passes, a pre-release (`dev-{sha}`) is created automatically. The `latest` tag is only updated when the commit has been signed off with `gh signoff integration`.
+
 ## Environment variables
 
 | Variable | Description | Set by |

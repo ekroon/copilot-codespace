@@ -21,6 +21,21 @@ type Client struct {
 	controlSocket string // path to control socket
 }
 
+// Executor defines the operations that MCP handlers use to interact with a codespace.
+type Executor interface {
+	ViewFile(ctx context.Context, path string, viewRange []int) (string, error)
+	EditFile(ctx context.Context, path, oldStr, newStr string) error
+	CreateFile(ctx context.Context, path, content string) error
+	RunBash(ctx context.Context, command string) (stdout, stderr string, exitCode int, err error)
+	Grep(ctx context.Context, pattern, path, glob string) (string, error)
+	Glob(ctx context.Context, pattern, path string) (string, error)
+	StartSession(ctx context.Context, sessionID, command string) error
+	WriteSession(ctx context.Context, sessionID, input string) error
+	ReadSession(ctx context.Context, sessionID string) (string, error)
+	StopSession(ctx context.Context, sessionID string) error
+	ListSessions(ctx context.Context) (string, error)
+}
+
 // NewClient creates a new SSH client for the given codespace.
 func NewClient(codespaceName string) *Client {
 	return &Client{codespaceName: codespaceName}
