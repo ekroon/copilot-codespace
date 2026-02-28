@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ekroon/copilot-codespace/internal/mcp"
+	"github.com/ekroon/copilot-codespace/internal/shellpatch"
 	"github.com/ekroon/copilot-codespace/internal/ssh"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -35,7 +36,7 @@ func main() {
 	}
 
 	// Otherwise, run as interactive launcher
-	if err := runLauncher(); err != nil {
+	if err := runLauncher(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -66,7 +67,18 @@ func runMCPServer() {
 	}
 }
 
-func runLauncher() error {
+func runLauncher(args []string) error {
+	// Parse --experimental-shell flag (consume it, don't pass to copilot)
+	experimentalShell := false
+	var copilotArgs []string
+	for _, arg := range args {
+		if arg == "--experimental-shell" {
+			experimentalShell = true
+		} else {
+			copilotArgs = append(copilotArgs, arg)
+		}
+	}
+
 	// The binary serves as both launcher and MCP server
 	self, err := os.Executable()
 	if err != nil {
@@ -127,11 +139,23 @@ func runLauncher() error {
 	fmt.Printf("  Codespace: %s\n", selected.Name)
 	fmt.Printf("  Workspace: %s\n", workdir)
 	fmt.Printf("  Excluded:  %d local tools\n", len(excludedTools))
+	if experimentalShell {
+		fmt.Printf("  Shell:     ! commands execute on codespace (experimental)\n")
+	}
 	fmt.Printf("\n  Shell access (from another terminal):\n")
 	fmt.Printf("    gh codespace ssh -c %s\n\n", selected.Name)
 
 	// Exec copilot from the instructions dir (cwd is already set)
-	return execCopilot(excludedTools, mcpConfig)
+	if experimentalShell {
+		// Get SSH connection details for the shell patch
+		sshClient := ssh.NewClient(selected.Name)
+		ctx := context.Background()
+		if err := sshClient.SetupMultiplexing(ctx); err != nil {
+			return fmt.Errorf("setting up SSH for shell patch: %w", err)
+		}
+		return execCopilotWithShellPatch(excludedTools, mcpConfig, copilotArgs, sshClient, workdir)
+	}
+	return execCopilot(excludedTools, mcpConfig, copilotArgs)
 }
 
 // selectCodespace lets the user pick a codespace interactively.
@@ -388,7 +412,7 @@ func buildMCPConfig(selfBinary, codespaceName, workdir string) string {
 	return string(b)
 }
 
-func execCopilot(excludedTools []string, mcpConfig string) error {
+func execCopilot(excludedTools []string, mcpConfig string, extraArgs []string) error {
 	copilotPath, err := exec.LookPath("copilot")
 	if err != nil {
 		return fmt.Errorf("copilot not found in PATH: %w", err)
@@ -399,8 +423,99 @@ func execCopilot(excludedTools []string, mcpConfig string) error {
 	}
 	args = append(args, excludedTools...)
 	args = append(args, "--additional-mcp-config", mcpConfig)
-	// Pass through any extra args from the command line
-	args = append(args, os.Args[1:]...)
+	args = append(args, extraArgs...)
 
 	return syscall.Exec(copilotPath, args, os.Environ())
+}
+
+// execCopilotWithShellPatch runs copilot's JS bundle via node with a require
+// patch that intercepts the "!" shell escape and redirects it over SSH.
+// This bypasses the native binary so the CJS patch can monkey-patch spawn.
+func execCopilotWithShellPatch(excludedTools []string, mcpConfig string, extraArgs []string, sshClient *ssh.Client, workdir string) error {
+	// Write the CJS patch to a temp file
+	patchPath, err := shellpatch.WritePatch()
+	if err != nil {
+		return fmt.Errorf("writing shell patch: %w", err)
+	}
+	defer os.RemoveAll(filepath.Dir(patchPath))
+
+	// Find copilot's index.js (the JS bundle)
+	indexJS, err := findCopilotIndexJS()
+	if err != nil {
+		return fmt.Errorf("finding copilot index.js: %w", err)
+	}
+
+	// Find node binary
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		return fmt.Errorf("node not found in PATH: %w", err)
+	}
+
+	// Build args: node --require <patch.cjs> <index.js> <copilot-args...>
+	args := []string{"node", "--require", patchPath, indexJS,
+		"--excluded-tools",
+	}
+	args = append(args, excludedTools...)
+	args = append(args, "--additional-mcp-config", mcpConfig)
+	args = append(args, extraArgs...)
+
+	// Add SSH connection info and workdir to env for the patch script
+	env := os.Environ()
+	if sshClient.SSHConfigPath() != "" {
+		env = append(env, "COPILOT_SSH_CONFIG="+sshClient.SSHConfigPath())
+		env = append(env, "COPILOT_SSH_HOST="+sshClient.SSHHost())
+	}
+	env = append(env, "CODESPACE_WORKDIR="+workdir)
+
+	// Pre-fetch the auth token from keychain so node doesn't trigger a
+	// macOS keychain prompt (the keychain ACL only trusts the native binary).
+	if token := readCopilotToken(); token != "" {
+		env = append(env, "COPILOT_GITHUB_TOKEN="+token)
+	}
+
+	return syscall.Exec(nodePath, args, env)
+}
+
+// findCopilotIndexJS locates copilot's index.js by following the symlink chain
+// from the `copilot` binary → npm-loader.js → index.js in the same directory.
+func findCopilotIndexJS() (string, error) {
+	copilotPath, err := exec.LookPath("copilot")
+	if err != nil {
+		return "", fmt.Errorf("copilot not found in PATH: %w", err)
+	}
+
+	// Resolve symlinks to get the actual npm-loader.js path
+	realPath, err := filepath.EvalSymlinks(copilotPath)
+	if err != nil {
+		return "", fmt.Errorf("resolving copilot path: %w", err)
+	}
+
+	// index.js is in the same directory as npm-loader.js
+	dir := filepath.Dir(realPath)
+	indexJS := filepath.Join(dir, "index.js")
+
+	if _, err := os.Stat(indexJS); err != nil {
+		return "", fmt.Errorf("copilot index.js not found at %s", indexJS)
+	}
+
+	return indexJS, nil
+}
+
+// readCopilotToken obtains a GitHub token for copilot auth.
+// Uses `gh auth token` to avoid macOS keychain popups (the keychain ACL
+// only trusts the native copilot binary, not node).
+// Returns empty string on any failure.
+func readCopilotToken() string {
+	// Skip if already set via env
+	for _, key := range []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"} {
+		if os.Getenv(key) != "" {
+			return ""
+		}
+	}
+
+	out, err := exec.Command("gh", "auth", "token").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
