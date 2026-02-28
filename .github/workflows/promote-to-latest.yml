@@ -11,15 +11,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Resolve HEAD of main
         id: resolve
         run: |
           SHA=$(git rev-parse HEAD)
           SHORT_SHA="${SHA::7}"
+          N=$(git rev-list --count HEAD)
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "tag=dev-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "version=v0.0.${N}" >> "$GITHUB_OUTPUT"
 
       - name: Check integration signoff
         env:
@@ -57,11 +61,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+
+          # Create semver release for mise
+          gh release create "${VERSION}" \
+            --title "${VERSION}" \
+            --notes "Build from commit ${{ steps.resolve.outputs.sha }}
+
+          ## Install with mise
+
+          \`\`\`sh
+          mise use -g github:ekroon/copilot-codespace
+          \`\`\`" \
+            ./artifacts/copilot-codespace-*
+
+          # Keep 'latest' tag as an alias
           gh release delete latest --yes 2>/dev/null || true
           git push origin :refs/tags/latest 2>/dev/null || true
           gh release create latest \
-            --title "Latest (${{ steps.resolve.outputs.tag }})" \
-            --notes "Latest build from commit ${{ steps.resolve.outputs.sha }}
+            --title "Latest (${VERSION})" \
+            --notes "Latest build from commit ${{ steps.resolve.outputs.sha }} (${VERSION})
 
           ## Install with mise
 
