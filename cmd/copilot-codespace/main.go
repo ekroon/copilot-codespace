@@ -239,11 +239,6 @@ func selectCodespace() (codespace, error) {
 
 func startCodespace(name string) error {
 	fmt.Println("Starting codespace (this may take a moment)...")
-	if err := exec.Command("gh", "codespace", "start", "-c", name).Run(); err != nil {
-		return fmt.Errorf("starting codespace: %w", err)
-	}
-
-	fmt.Println("Waiting for SSH readiness...")
 	time.Sleep(3 * time.Second)
 
 	for i := 0; i < 30; i++ {
