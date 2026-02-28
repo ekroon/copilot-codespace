@@ -72,4 +72,13 @@ fi
 
 echo ""
 echo "All critical tests passed!"
-echo "Sign off with: gh signoff integration"
+
+# Auto-signoff if gh-signoff is installed
+if gh signoff integration 2>/dev/null; then
+  echo ""
+  echo "✅ Signed off on $(git rev-parse --short HEAD)"
+else
+  echo ""
+  echo "⚠️  gh-signoff not installed. Run: ./scripts/setup-signoff.sh"
+  echo "   Then re-run this script to sign off automatically."
+fi
