@@ -84,12 +84,9 @@ gh signoff integration
 
 ### Release flow
 
-Every push to `main` triggers CI (vet, test, cross-platform build). If CI passes, a pre-release (`dev-{sha}`) is created automatically. The `latest` tag is only updated when the commit has been signed off with `gh signoff integration`.
+Every push to `main` triggers CI (vet, test, cross-platform build). If CI passes, a pre-release (`dev-{sha}`) is created automatically.
 
-There are two ways `latest` gets updated:
-
-1. **Automatic** — If the signoff exists when the push-triggered release runs, `latest` is updated immediately.
-2. **Manual** — Run the "Promote to Latest" workflow from the GitHub Actions tab (or `gh workflow run promote-to-latest.yml`). It checks signoff on the latest main commit and promotes the existing pre-release to `latest`.
+To promote to `latest`, run the "Promote to Latest" workflow from the GitHub Actions tab (or `gh workflow run promote-to-latest.yml`). It checks signoff on the latest main commit and promotes the existing pre-release to `latest`.
 
 ## Environment variables
 

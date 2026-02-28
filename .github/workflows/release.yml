@@ -56,33 +56,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-
-      - name: Compute version
-        id: version
-        run: |
-          N=$(git rev-list --count HEAD)
-          echo "tag=v0.0.${N}" >> "$GITHUB_OUTPUT"
-
-      - name: Check signoff status
-        id: signoff
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          STATUS=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/status" \
-            --jq '.statuses[] | select(.context == "signoff/integration") | .state' 2>/dev/null || echo "")
-          if [[ "$STATUS" == "success" ]]; then
-            echo "signed_off=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "signed_off=false" >> "$GITHUB_OUTPUT"
-            echo "⏸️  No integration signoff — skipping latest tag update"
-            echo "   Run locally: ./scripts/integration-test.sh && gh signoff integration"
-          fi
 
       - name: Create pre-release
         env:
@@ -101,39 +78,4 @@ jobs:
           mise use -g github:ekroon/copilot-codespace
           \`\`\`" \
             --prerelease \
-            copilot-codespace-*
-
-      - name: Update the 'latest' tag
-        if: steps.signoff.outputs.signed_off == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-          VERSION="${{ steps.version.outputs.tag }}"
-
-          # Create semver release for mise
-          gh release create "${VERSION}" \
-            --title "${VERSION}" \
-            --notes "Build from commit ${GITHUB_SHA}
-
-          ## Install with mise
-
-          \`\`\`sh
-          mise use -g github:ekroon/copilot-codespace
-          \`\`\`" \
-            copilot-codespace-*
-
-          # Keep 'latest' tag as an alias
-          gh release delete latest --yes 2>/dev/null || true
-          git push origin :refs/tags/latest 2>/dev/null || true
-          gh release create latest \
-            --title "Latest (${VERSION})" \
-            --notes "Latest build from commit ${GITHUB_SHA} (${VERSION})
-
-          ## Install with mise
-
-          \`\`\`sh
-          mise use -g github:ekroon/copilot-codespace
-          \`\`\`" \
             copilot-codespace-*

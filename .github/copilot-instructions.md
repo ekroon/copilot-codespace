@@ -39,4 +39,4 @@ Key packages:
 
 ## Release flow
 
-Every push to `main` triggers CI (vet, test, cross-platform build). If CI passes, a pre-release (`dev-{sha}`) is created. The `latest` tag is only updated after `gh signoff integration` has been run against the commit.
+Every push to `main` triggers CI (vet, test, cross-platform build). If CI passes, a pre-release (`dev-{sha}`) is created. The `latest` tag is only updated by running the "Promote to Latest" workflow (`gh workflow run promote-to-latest.yml`) after `gh signoff integration` has been run against the commit.
