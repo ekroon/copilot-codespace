@@ -47,7 +47,7 @@ fi
 # 5. If codespace available, test SSH
 echo ""
 echo "Test: SSH to codespace..."
-CODESPACE=$(gh codespace list --json name,state --limit 1 -q '.[] | select(.state == "Available") | .name' 2>/dev/null || true)
+CODESPACE=$(gh codespace list --json name,state -q '.[] | select(.state == "Available") | .name' 2>/dev/null | head -1 || true)
 if [[ -n "$CODESPACE" ]]; then
   if gh codespace ssh -c "$CODESPACE" -- echo "hello" > /dev/null 2>&1; then
     pass "SSH to codespace $CODESPACE"
@@ -69,6 +69,13 @@ if [[ $FAIL -gt 0 ]]; then
   echo ""
   echo "Fix failures before signing off."
   exit 1
+fi
+
+if [[ $SKIP -gt 0 ]]; then
+  echo ""
+  echo "All executed tests passed, but some were skipped."
+  echo "A running codespace is required for full sign-off."
+  exit 0
 fi
 
 echo ""
