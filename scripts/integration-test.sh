@@ -5,9 +5,9 @@ PASS=0
 FAIL=0
 SKIP=0
 
-pass() { echo "  ✓ $1"; ((PASS++)); }
-fail() { echo "  ✗ $1"; ((FAIL++)); }
-skip() { echo "  ⊘ $1 (skipped)"; ((SKIP++)); }
+pass() { echo "  ✓ $1"; PASS=$((PASS + 1)); }
+fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
+skip() { echo "  ⊘ $1 (skipped)"; SKIP=$((SKIP + 1)); }
 
 echo "=== copilot-codespace integration tests ==="
 echo ""
@@ -17,18 +17,19 @@ echo "Building..."
 go build -o ./copilot-codespace ./cmd/copilot-codespace
 pass "Binary compiles"
 
-# 2. Binary doesn't crash on bad args
-echo ""
-echo "Test: binary handles bad args..."
-./copilot-codespace --nonexistent 2>&1 || true
-pass "Binary doesn't crash"
-
-# 3. MCP server starts and responds to JSON-RPC initialize
+# 2. MCP server starts and responds to JSON-RPC initialize
 echo ""
 echo "Test: MCP server responds to initialize..."
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}'
-RESPONSE=$(echo "$INIT_REQ" | CODESPACE_NAME=test-dummy timeout 5 ./copilot-codespace mcp 2>/dev/null | head -1) || true
-if echo "$RESPONSE" | jq -e '.result.serverInfo' > /dev/null 2>&1; then
+MCP_OUT=$(mktemp)
+printf '%s\n' "$INIT_REQ" | CODESPACE_NAME=test-dummy ./copilot-codespace mcp > "$MCP_OUT" 2>/dev/null &
+MCP_PID=$!
+sleep 3
+kill "$MCP_PID" 2>/dev/null || true
+wait "$MCP_PID" 2>/dev/null || true
+FIRST_LINE=$(head -1 "$MCP_OUT")
+rm -f "$MCP_OUT"
+if echo "$FIRST_LINE" | jq -e '.result.serverInfo' > /dev/null 2>&1; then
   pass "MCP server responds to initialize"
 else
   fail "MCP server did not respond correctly"
