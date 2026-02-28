@@ -82,11 +82,22 @@ echo ""
 echo "All critical tests passed!"
 
 # Auto-signoff if gh-signoff is installed
-if gh signoff integration 2>/dev/null; then
-  echo ""
-  echo "✅ Signed off on $(git rev-parse --short HEAD)"
-else
+if ! gh extension list 2>/dev/null | grep -q signoff; then
   echo ""
   echo "⚠️  gh-signoff not installed. Run: ./scripts/setup-signoff.sh"
   echo "   Then re-run this script to sign off automatically."
+elif gh signoff integration; then
+  echo ""
+  echo "✅ Signed off on $(git rev-parse --short HEAD)"
+  echo ""
+  echo "Triggering promote-to-latest workflow..."
+  if gh workflow run promote-to-latest.yml; then
+    echo "✅ Promote-to-latest workflow triggered"
+  else
+    echo "⚠️  Failed to trigger promote-to-latest workflow. Run manually:"
+    echo "   gh workflow run promote-to-latest.yml"
+  fi
+else
+  echo ""
+  echo "⚠️  Signoff failed. Check errors above."
 fi
