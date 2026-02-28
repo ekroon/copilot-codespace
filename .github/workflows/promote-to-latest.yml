@@ -1,0 +1,71 @@
+name: Promote to Latest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve HEAD of main
+        id: resolve
+        run: |
+          SHA=$(git rev-parse HEAD)
+          SHORT_SHA="${SHA::7}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=dev-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Check integration signoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          STATUS=$(gh api "repos/${{ github.repository }}/commits/${{ steps.resolve.outputs.sha }}/status" \
+            --jq '.statuses[] | select(.context == "signoff/integration") | .state' 2>/dev/null || echo "")
+          if [[ "$STATUS" != "success" ]]; then
+            echo "::error::No integration signoff on ${{ steps.resolve.outputs.short_sha }}. Run: ./scripts/integration-test.sh"
+            exit 1
+          fi
+          echo "✅ Integration signoff found on ${{ steps.resolve.outputs.short_sha }}"
+
+      - name: Verify pre-release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "${{ steps.resolve.outputs.tag }}" > /dev/null 2>&1; then
+            echo "::error::Pre-release ${{ steps.resolve.outputs.tag }} not found. Wait for the Release workflow to finish."
+            exit 1
+          fi
+          echo "✅ Pre-release ${{ steps.resolve.outputs.tag }} exists"
+
+      - name: Download pre-release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release download "${{ steps.resolve.outputs.tag }}" --pattern 'copilot-codespace-*' --dir ./artifacts
+          ls -la ./artifacts/
+
+      - name: Promote to latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete latest --yes 2>/dev/null || true
+          git push origin :refs/tags/latest 2>/dev/null || true
+          gh release create latest \
+            --title "Latest (${{ steps.resolve.outputs.tag }})" \
+            --notes "Latest build from commit ${{ steps.resolve.outputs.sha }}
+
+          ## Install with mise
+
+          \`\`\`sh
+          mise use -g github:ekroon/copilot-codespace
+          \`\`\`" \
+            ./artifacts/copilot-codespace-*
