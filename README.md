@@ -6,9 +6,9 @@ Launch Copilot CLI with all file/bash operations executing on a remote GitHub Co
 
 A single Go binary (`copilot-codespace`) serves two roles:
 
-1. **Launcher mode** (default) — Lists your codespaces, lets you pick one, starts it if needed, fetches instruction files, then launches `copilot` with:
+1. **Launcher mode** (default) — Lists your codespaces, lets you pick one, starts it if needed, fetches instruction files and project-level components, then launches `copilot` with:
    - `--excluded-tools` — disables 11 built-in local tools
-   - `--additional-mcp-config` — adds itself as the MCP server
+   - `--additional-mcp-config` — adds itself as the MCP server (plus any remote MCP configs)
    - `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` — points to fetched remote instruction files
 
 2. **MCP server mode** (`copilot-codespace mcp`) — Spawned by copilot, provides 10 remote tools over SSH:
@@ -41,6 +41,27 @@ copilot-codespace
 # Pass extra copilot flags
 copilot-codespace --model claude-sonnet-4.5
 ```
+
+## What gets fetched from the codespace
+
+The launcher fetches all project-level Copilot CLI components in a single SSH call:
+
+| Component | Remote path | Local handling |
+|---|---|---|
+| Copilot instructions | `.github/copilot-instructions.md` | Mirrored |
+| Scoped instructions | `.github/instructions/*.instructions.md` | Mirrored |
+| Agent files | `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` (recursive) | Mirrored |
+| **Custom agents** | `.github/agents/*.agent.md`, `.claude/agents/*.agent.md` | Mirrored |
+| **Skills** | `.github/skills/`, `.agents/skills/`, `.claude/skills/` (full trees) | Mirrored |
+| **Commands** | `.claude/commands/` | Mirrored |
+| **Hooks** | `.github/hooks/*.json` | Rewritten for SSH forwarding |
+| **MCP servers** | `.copilot/mcp-config.json`, `.vscode/mcp.json`, `.mcp.json`, `.github/mcp.json` | Parsed & forwarded over SSH |
+
+**Skills** include supporting files (scripts, templates) so Copilot can read them during skill loading. Actual script execution happens remotely via `remote_bash`.
+
+**Hooks** have their bash commands rewritten to execute on the codespace via SSH. Stdin/stdout piping through SSH preserves `preToolUse` allow/deny behavior.
+
+**MCP servers** are rewritten to forward stdio over SSH, so remote MCP tools appear as local tools to Copilot.
 
 ## Known limitations
 

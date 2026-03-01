@@ -313,7 +313,8 @@ func fetchInstructionFiles(sshClient *ssh.Client, codespaceName, workdir string)
 
 	fmt.Println("Fetching instruction files from codespace...")
 
-	// Discover and fetch ALL instruction files in a single SSH call.
+	// Discover and fetch ALL instruction files, skills, agents, commands,
+	// hooks, and MCP configs in a single SSH call.
 	// Each file is output as: ===FILE_BOUNDARY===\n<relpath>\n<base64-content>
 	batchScript := fmt.Sprintf(`
 WD=%s
@@ -323,6 +324,16 @@ files=(
   $(find "$WD/.github/instructions" -name '*.instructions.md' 2>/dev/null)
   $(find "$WD" \( -name 'AGENTS.md' -o -name 'CLAUDE.md' -o -name 'GEMINI.md' \) 2>/dev/null | grep -v '/\.git/')
   $(test -f "$WD/.copilot/mcp-config.json" && echo "$WD/.copilot/mcp-config.json")
+  $(find "$WD/.github/agents" -name '*.agent.md' 2>/dev/null)
+  $(find "$WD/.claude/agents" -name '*.agent.md' 2>/dev/null)
+  $(find "$WD/.github/skills" -type f 2>/dev/null)
+  $(find "$WD/.agents/skills" -type f 2>/dev/null)
+  $(find "$WD/.claude/skills" -type f 2>/dev/null)
+  $(test -f "$WD/.vscode/mcp.json" && echo "$WD/.vscode/mcp.json")
+  $(test -f "$WD/.mcp.json" && echo "$WD/.mcp.json")
+  $(test -f "$WD/.github/mcp.json" && echo "$WD/.github/mcp.json")
+  $(find "$WD/.claude/commands" -type f 2>/dev/null)
+  $(find "$WD/.github/hooks" -name '*.json' 2>/dev/null)
 )
 for f in "${files[@]}"; do
   echo "$SEP"
@@ -342,16 +353,46 @@ echo "$SEP"
 	// Parse batched output and write files
 	var remoteMCPConfig map[string]any
 	files := parseBatchedOutput(output, workdir)
+
+	// MCP config locations to parse (not written to mirror)
+	mcpConfigPaths := map[string]bool{
+		".copilot/mcp-config.json": true,
+		".vscode/mcp.json":        true,
+		".mcp.json":               true,
+		".github/mcp.json":        true,
+	}
+
 	for relPath, content := range files {
-		if relPath == ".copilot/mcp-config.json" {
+		if mcpConfigPaths[relPath] {
 			// Parse MCP config for server rewriting instead of writing to mirror
-			remoteMCPConfig = parseMCPConfigJSON(content)
-			if remoteMCPConfig != nil {
-				for name := range remoteMCPConfig {
-					fmt.Printf("  ✓ MCP server: %s (forwarded over SSH)\n", name)
+			parsed := parseMCPConfigJSON(content)
+			if parsed != nil {
+				if remoteMCPConfig == nil {
+					remoteMCPConfig = make(map[string]any)
+				}
+				for name, server := range parsed {
+					if _, exists := remoteMCPConfig[name]; !exists {
+						remoteMCPConfig[name] = server
+						fmt.Printf("  ✓ MCP server: %s (from %s, forwarded over SSH)\n", name, relPath)
+					}
 				}
 			}
 			continue
+		}
+		if strings.HasPrefix(relPath, ".github/hooks/") && strings.HasSuffix(relPath, ".json") {
+			// Rewrite hook commands to execute on the codespace via SSH.
+			// If rewriting fails, skip the file — writing the original would
+			// leave hooks that try to run scripts locally (which don't exist).
+			rewritten := rewriteHooksForSSH(content, codespaceName, workdir)
+			if rewritten != nil {
+				content = rewritten
+				fmt.Printf("  ✓ %s (hooks forwarded over SSH)\n", relPath)
+			} else {
+				fmt.Fprintf(os.Stderr, "  ⚠ %s (skipped: could not rewrite for SSH)\n", relPath)
+				continue
+			}
+		} else {
+			fmt.Printf("  ✓ %s\n", relPath)
 		}
 		localPath := filepath.Join(baseDir, relPath)
 		if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
@@ -360,7 +401,6 @@ echo "$SEP"
 		if err := os.WriteFile(localPath, content, 0o644); err != nil {
 			continue
 		}
-		fmt.Printf("  ✓ %s\n", relPath)
 	}
 
 	return baseDir, remoteMCPConfig, nil
@@ -543,6 +583,76 @@ func rewriteMCPServerForSSH(server map[string]any, codespaceName, workdir string
 		"command": "gh",
 		"args":    []string{"codespace", "ssh", "-c", codespaceName, "--", "bash", "-c", remoteCmd},
 	}
+}
+
+// rewriteHooksForSSH rewrites hook commands in a hooks JSON file to execute
+// on the codespace via SSH. Each hook's bash command is wrapped in an SSH call
+// so scripts run remotely. Stdin/stdout piping through SSH preserves
+// preToolUse allow/deny behavior.
+func rewriteHooksForSSH(content []byte, codespaceName, workdir string) []byte {
+	var config map[string]any
+	if err := json.Unmarshal(content, &config); err != nil {
+		return nil
+	}
+
+	hooks, ok := config["hooks"].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	modified := false
+	for event, handlers := range hooks {
+		handlerList, ok := handlers.([]any)
+		if !ok {
+			continue
+		}
+		for i, handler := range handlerList {
+			h, ok := handler.(map[string]any)
+			if !ok {
+				continue
+			}
+			bashCmd, ok := h["bash"].(string)
+			if !ok || bashCmd == "" {
+				continue
+			}
+
+			// Build remote command with cd to workdir (+ optional cwd)
+			remoteCwd := workdir
+			if cwd, ok := h["cwd"].(string); ok && cwd != "" && cwd != "." {
+				remoteCwd = workdir + "/" + cwd
+			}
+
+			// Build env export prefix
+			envPrefix := ""
+			if env, ok := h["env"].(map[string]any); ok {
+				for k, v := range env {
+					if s, ok := v.(string); ok {
+						envPrefix += fmt.Sprintf("export %s=%s && ", k, shellQuote(s))
+					}
+				}
+			}
+
+			remoteCmd := fmt.Sprintf("cd %s && %s%s", shellQuote(remoteCwd), envPrefix, bashCmd)
+			h["bash"] = fmt.Sprintf("gh codespace ssh -c %s -- bash -c %s", codespaceName, shellQuote(remoteCmd))
+			// Clear cwd and env since they're baked into the SSH command
+			delete(h, "cwd")
+			delete(h, "env")
+			handlerList[i] = h
+			modified = true
+		}
+		hooks[event] = handlerList
+	}
+
+	if !modified {
+		return nil
+	}
+
+	config["hooks"] = hooks
+	out, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 func shellQuote(s string) string {

@@ -233,3 +233,145 @@ func assertTrustedFolders(t *testing.T, configPath string, want []string) {
 		}
 	}
 }
+
+func TestParseMCPConfigJSON_MultipleLocations(t *testing.T) {
+	// Verify that parseMCPConfigJSON works for configs from all supported locations
+	tests := []struct {
+		name    string
+		content string
+		want    []string // expected server names
+	}{
+		{
+			name:    "copilot-mcp-config",
+			content: `{"mcpServers":{"db-tool":{"command":"db-mcp"}}}`,
+			want:    []string{"db-tool"},
+		},
+		{
+			name:    "vscode-mcp",
+			content: `{"mcpServers":{"vscode-server":{"command":"vscode-mcp"}}}`,
+			want:    []string{"vscode-server"},
+		},
+		{
+			name:    "root-mcp",
+			content: `{"mcpServers":{"root-server":{"command":"root-mcp"}}}`,
+			want:    []string{"root-server"},
+		},
+		{
+			name:    "empty-servers",
+			content: `{"mcpServers":{}}`,
+			want:    nil,
+		},
+		{
+			name:    "invalid-json",
+			content: `{invalid`,
+			want:    nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := parseMCPConfigJSON([]byte(tc.content))
+			if tc.want == nil {
+				if result != nil {
+					t.Errorf("expected nil, got %v", result)
+				}
+				return
+			}
+			if result == nil {
+				t.Fatal("expected non-nil result")
+			}
+			for _, name := range tc.want {
+				if _, ok := result[name]; !ok {
+					t.Errorf("missing server %q", name)
+				}
+			}
+		})
+	}
+}
+
+func TestRewriteHooksForSSH(t *testing.T) {
+	hooksJSON := `{
+		"version": 1,
+		"hooks": {
+			"sessionStart": [
+				{
+					"type": "command",
+					"bash": "echo 'started'",
+					"cwd": ".",
+					"timeoutSec": 10
+				}
+			],
+			"preToolUse": [
+				{
+					"type": "command",
+					"bash": "./scripts/policy-check.sh",
+					"cwd": "scripts",
+					"env": {"LOG_LEVEL": "INFO"}
+				}
+			]
+		}
+	}`
+
+	result := rewriteHooksForSSH([]byte(hooksJSON), "my-cs", "/workspaces/repo")
+	if result == nil {
+		t.Fatal("rewriteHooksForSSH returned nil")
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	hooks := parsed["hooks"].(map[string]any)
+
+	// Check sessionStart hook was rewritten
+	sessionStart := hooks["sessionStart"].([]any)
+	if len(sessionStart) != 1 {
+		t.Fatalf("expected 1 sessionStart hook, got %d", len(sessionStart))
+	}
+	hook0 := sessionStart[0].(map[string]any)
+	bash0 := hook0["bash"].(string)
+	if !contains(bash0, "gh codespace ssh") {
+		t.Errorf("sessionStart bash should contain 'gh codespace ssh', got %q", bash0)
+	}
+	if !contains(bash0, "my-cs") {
+		t.Errorf("sessionStart bash should contain codespace name, got %q", bash0)
+	}
+	if !contains(bash0, "echo") {
+		t.Errorf("sessionStart bash should contain original command, got %q", bash0)
+	}
+	// cwd should be removed (baked into SSH command)
+	if _, ok := hook0["cwd"]; ok {
+		t.Error("cwd should be removed from rewritten hook")
+	}
+
+	// Check preToolUse hook was rewritten
+	preToolUse := hooks["preToolUse"].([]any)
+	hook1 := preToolUse[0].(map[string]any)
+	bash1 := hook1["bash"].(string)
+	if !contains(bash1, "./scripts/policy-check.sh") {
+		t.Errorf("preToolUse bash should contain original command, got %q", bash1)
+	}
+	// Env should be removed (baked into SSH command)
+	if _, ok := hook1["env"]; ok {
+		t.Error("env should be removed from rewritten hook")
+	}
+	// Verify env was baked into the command
+	if !contains(bash1, "LOG_LEVEL") {
+		t.Errorf("env vars should be baked into SSH command, got %q", bash1)
+	}
+}
+
+func TestRewriteHooksForSSH_NoHooks(t *testing.T) {
+	result := rewriteHooksForSSH([]byte(`{"version": 1}`), "cs", "/workspaces/repo")
+	if result != nil {
+		t.Error("expected nil for config with no hooks")
+	}
+}
+
+func TestRewriteHooksForSSH_InvalidJSON(t *testing.T) {
+	result := rewriteHooksForSSH([]byte(`{invalid`), "cs", "/workspaces/repo")
+	if result != nil {
+		t.Error("expected nil for invalid JSON")
+	}
+}

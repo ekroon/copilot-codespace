@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ekroon/copilot-codespace/internal/ssh"
 )
@@ -47,10 +48,23 @@ func testSSHClient(t *testing.T, cs string) *ssh.Client {
 }
 
 // testFetchInstructionFiles wraps fetchInstructionFiles with SSH client setup.
+// On first call, it provisions test fixtures on the codespace.
 func testFetchInstructionFiles(t *testing.T, cs, wd string) (string, map[string]any, error) {
 	t.Helper()
+	setupTestFixturesOnce(t, cs, wd)
 	client := testSSHClient(t, cs)
 	return fetchInstructionFiles(client, cs, wd)
+}
+
+var fixturesReady bool
+
+func setupTestFixturesOnce(t *testing.T, cs, wd string) {
+	t.Helper()
+	if fixturesReady {
+		return
+	}
+	setupTestFixtures(t, cs, wd)
+	fixturesReady = true
 }
 
 func setupMirrorDir(t *testing.T) string {
@@ -343,6 +357,320 @@ func TestIntegration_ApplyToWorksWithCopilotCLI(t *testing.T) {
 	}
 }
 
+func TestIntegration_SkillFiles(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	dir, _, err := testFetchInstructionFiles(t, cs, wd)
+	if err != nil {
+		t.Fatalf("fetchInstructionFiles: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Skills should be fetched from all supported locations
+	expectFile(t, dir, ".github/skills/test-skill/SKILL.md")
+	expectFile(t, dir, ".claude/skills/deploy/SKILL.md")
+}
+
+func TestIntegration_SkillContent(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	dir, _, err := testFetchInstructionFiles(t, cs, wd)
+	if err != nil {
+		t.Fatalf("fetchInstructionFiles: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	content := readFileContent(t, filepath.Join(dir, ".github/skills/test-skill/SKILL.md"))
+	if !strings.Contains(content, "name:") {
+		t.Error("SKILL.md should contain frontmatter with name field")
+	}
+}
+
+func TestIntegration_SkillSupportingFiles(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	dir, _, err := testFetchInstructionFiles(t, cs, wd)
+	if err != nil {
+		t.Fatalf("fetchInstructionFiles: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Skills with supporting scripts should have those scripts mirrored
+	expectFile(t, dir, ".github/skills/test-skill/scripts/helper.sh")
+}
+
+func TestIntegration_CustomAgents(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	dir, _, err := testFetchInstructionFiles(t, cs, wd)
+	if err != nil {
+		t.Fatalf("fetchInstructionFiles: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Custom agents should be fetched
+	expectFile(t, dir, ".github/agents/reviewer.agent.md")
+	expectFile(t, dir, ".claude/agents/helper.agent.md")
+}
+
+func TestIntegration_CustomAgentContent(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	dir, _, err := testFetchInstructionFiles(t, cs, wd)
+	if err != nil {
+		t.Fatalf("fetchInstructionFiles: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	content := readFileContent(t, filepath.Join(dir, ".github/agents/reviewer.agent.md"))
+	if !strings.Contains(content, "name:") {
+		t.Error("agent.md should contain frontmatter with name field")
+	}
+}
+
+func TestIntegration_Commands(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	dir, _, err := testFetchInstructionFiles(t, cs, wd)
+	if err != nil {
+		t.Fatalf("fetchInstructionFiles: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Commands should be fetched
+	expectFile(t, dir, ".claude/commands/test-command.md")
+}
+
+func TestIntegration_HooksForwarding(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	dir, _, err := testFetchInstructionFiles(t, cs, wd)
+	if err != nil {
+		t.Fatalf("fetchInstructionFiles: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Hooks should be fetched and rewritten for SSH
+	hooksPath := filepath.Join(dir, ".github/hooks/test-hooks.json")
+	expectFile(t, dir, ".github/hooks/test-hooks.json")
+
+	content := readFileContent(t, hooksPath)
+
+	// The hook bash commands should have been rewritten to use SSH
+	if !strings.Contains(content, "gh codespace ssh") {
+		t.Errorf("hooks should be rewritten for SSH forwarding, got: %s", content)
+	}
+	if !strings.Contains(content, cs) {
+		t.Errorf("hooks should reference the codespace name %q, got: %s", cs, content)
+	}
+}
+
+func TestIntegration_HooksForwardingEndToEnd(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	dir, _, err := testFetchInstructionFiles(t, cs, wd)
+	if err != nil {
+		t.Fatalf("fetchInstructionFiles: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Parse the rewritten hooks JSON to extract the actual bash command
+	hooksContent := readFileContent(t, filepath.Join(dir, ".github/hooks/test-hooks.json"))
+	var hooksConfig map[string]any
+	if err := json.Unmarshal([]byte(hooksContent), &hooksConfig); err != nil {
+		t.Fatalf("invalid hooks JSON: %v", err)
+	}
+
+	hooks := hooksConfig["hooks"].(map[string]any)
+	preToolUse := hooks["preToolUse"].([]any)
+	hook := preToolUse[0].(map[string]any)
+	bashCmd := hook["bash"].(string)
+
+	// Execute the rewritten hook command, piping a preToolUse event via stdin.
+	// The test-hook.sh script on the codespace should read stdin and respond
+	// with a JSON allow decision.
+	event := `{"event":"preToolUse","toolName":"bash","toolInput":{"command":"echo hello"}}`
+	cmd := exec.Command("bash", "-c", bashCmd)
+	cmd.Stdin = strings.NewReader(event + "\n")
+
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("hook command failed: %v\nstderr: %s", err, string(exitErr.Stderr))
+		}
+		t.Fatalf("hook command failed: %v", err)
+	}
+
+	// The test hook script should return a JSON response
+	var resp map[string]any
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatalf("invalid JSON response from hook: %v (raw: %s)", err, string(out))
+	}
+
+	decision, ok := resp["permissionDecision"].(string)
+	if !ok {
+		t.Fatalf("missing permissionDecision in hook response: %v", resp)
+	}
+	if decision != "allow" {
+		t.Errorf("permissionDecision = %q, want 'allow'", decision)
+	}
+}
+
+func TestIntegration_MCPForwardingEndToEnd_VSCode(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	// Fetch and get remote MCP configs (includes .vscode/mcp.json)
+	_, remoteMCP, err := testFetchInstructionFiles(t, cs, wd)
+	if err != nil {
+		t.Fatalf("fetchInstructionFiles: %v", err)
+	}
+
+	if remoteMCP == nil {
+		t.Fatal("remoteMCPServers should not be nil")
+	}
+
+	vscodeServer, ok := remoteMCP["vscode-test-server"]
+	if !ok {
+		t.Fatal("missing vscode-test-server from .vscode/mcp.json")
+	}
+
+	// Rewrite for SSH (same as buildMCPConfig does)
+	serverConfig, ok := vscodeServer.(map[string]any)
+	if !ok {
+		t.Fatal("vscode-test-server config should be a map")
+	}
+	rewritten := rewriteMCPServerForSSH(serverConfig, cs, wd)
+	if rewritten == nil {
+		t.Fatal("rewriteMCPServerForSSH returned nil for vscode-test-server")
+	}
+
+	// Execute the rewritten MCP server command and send an initialize request
+	initReq := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}`
+
+	command := rewritten["command"].(string)
+	args := rewritten["args"].([]string)
+	cmd := exec.Command(command, args...)
+	cmd.Stdin = strings.NewReader(initReq + "\n")
+
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("MCP server via SSH failed: %v\nstderr: %s", err, string(exitErr.Stderr))
+		}
+		t.Fatalf("MCP server via SSH failed: %v", err)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatalf("invalid JSON-RPC response: %v (raw: %s)", err, string(out))
+	}
+
+	result, ok := resp["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing result in response: %v", resp)
+	}
+
+	serverInfo, ok := result["serverInfo"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing serverInfo in result: %v", result)
+	}
+
+	if name, _ := serverInfo["name"].(string); name != "test-mcp" {
+		t.Errorf("serverInfo.name = %q, want 'test-mcp'", name)
+	}
+}
+
+// TestIntegration_HookTriggeredByCopilot verifies the full hook pipeline:
+// Copilot CLI discovers hooks from the mirror directory → triggers sessionStart →
+// executes the rewritten bash command (which SSHs into the codespace) →
+// hook script runs on codespace and writes a marker file.
+func TestIntegration_HookTriggeredByCopilot(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	dir, _, err := testFetchInstructionFiles(t, cs, wd)
+	if err != nil {
+		t.Fatalf("fetchInstructionFiles: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	exec.Command("git", "-C", dir, "init", "-q").Run()
+
+	copilotPath, err := exec.LookPath("copilot")
+	if err != nil {
+		t.Skip("copilot not found in PATH")
+	}
+
+	// Clean marker files on codespace before test
+	markers := []string{
+		"/tmp/copilot-hook-e2e-session-start",
+		"/tmp/copilot-hook-e2e-pre-tool-use",
+	}
+	for _, m := range markers {
+		exec.Command("gh", "codespace", "ssh", "-c", cs, "--", "rm", "-f", m).Run()
+	}
+	defer func() {
+		for _, m := range markers {
+			exec.Command("gh", "codespace", "ssh", "-c", cs, "--", "rm", "-f", m).Run()
+		}
+	}()
+
+	// Run copilot with a minimal prompt. The sessionStart hook should fire
+	// on startup and write a marker file on the codespace via SSH.
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, copilotPath,
+		"-p", "Say the word hello and nothing else",
+		"--allow-all-tools",
+	)
+	cmd.Dir = dir
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("copilot -p failed: %v\nOutput: %s", err, string(out))
+	}
+
+	// sessionStart hook should have fired and created the marker on the codespace
+	if exec.Command("gh", "codespace", "ssh", "-c", cs, "--",
+		"test", "-f", "/tmp/copilot-hook-e2e-session-start").Run() != nil {
+		t.Error("sessionStart hook was not triggered on codespace (marker file not found)")
+	}
+}
+
+func TestIntegration_AdditionalMCPConfigs(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	_, remoteMCP, err := testFetchInstructionFiles(t, cs, wd)
+	if err != nil {
+		t.Fatalf("fetchInstructionFiles: %v", err)
+	}
+
+	if remoteMCP == nil {
+		t.Fatal("remoteMCPServers should not be nil")
+	}
+
+	// The test codespace should have the test-server from .copilot/mcp-config.json
+	if _, ok := remoteMCP["test-server"]; !ok {
+		t.Error("missing test-server from .copilot/mcp-config.json")
+	}
+
+	// And the vscode-test-server from .vscode/mcp.json
+	if _, ok := remoteMCP["vscode-test-server"]; !ok {
+		t.Error("missing vscode-test-server from .vscode/mcp.json")
+	}
+}
+
 // --- helpers ---
 
 func expectFile(t *testing.T, dir, relPath string) {
@@ -367,27 +695,146 @@ func readFileContent(t *testing.T, path string) string {
 	return string(data)
 }
 
-// ensureTestFixtures verifies the test codespace has the expected files.
-// Call this to get a clear error if fixtures are missing.
-func ensureTestFixtures(t *testing.T, cs, wd string) {
+// setupTestFixtures creates all required test fixture files on the codespace
+// via a single SSH call. This makes integration tests self-contained — no
+// manual setup required. Existing fixture files are overwritten.
+func setupTestFixtures(t *testing.T, cs, wd string) {
 	t.Helper()
-	required := []string{
-		".github/copilot-instructions.md",
-		"AGENTS.md",
-		"CLAUDE.md",
-		"GEMINI.md",
-		"docs/AGENTS.md",
-		"teams/backend/AGENTS.md",
-		".github/instructions/ruby.instructions.md",
-		".copilot/mcp-config.json",
-		".copilot/test-mcp-server.py",
-	}
 
-	for _, f := range required {
-		remotePath := fmt.Sprintf("%s/%s", wd, f)
-		if exec.Command("gh", "codespace", "ssh", "-c", cs, "--",
-			fmt.Sprintf("test -f %s", remotePath)).Run() != nil {
-			t.Fatalf("missing test fixture on codespace: %s\nRun the fixture setup commands first.", f)
-		}
+	script := fmt.Sprintf(`
+set -e
+WD=%s
+
+# --- Instruction files (pre-existing fixtures) ---
+mkdir -p "$WD/.github/instructions/frontend" "$WD/.github/instructions/backend/api"
+mkdir -p "$WD/docs" "$WD/teams/backend"
+
+test -f "$WD/.github/copilot-instructions.md" || echo '# Copilot Instructions' > "$WD/.github/copilot-instructions.md"
+test -f "$WD/AGENTS.md" || echo '# Root AGENTS' > "$WD/AGENTS.md"
+test -f "$WD/CLAUDE.md" || echo '# Root CLAUDE' > "$WD/CLAUDE.md"
+test -f "$WD/GEMINI.md" || echo '# Root GEMINI' > "$WD/GEMINI.md"
+test -f "$WD/docs/AGENTS.md" || echo '# Docs AGENTS' > "$WD/docs/AGENTS.md"
+test -f "$WD/docs/CLAUDE.md" || echo '# Docs CLAUDE' > "$WD/docs/CLAUDE.md"
+test -f "$WD/teams/backend/AGENTS.md" || echo '# Backend AGENTS' > "$WD/teams/backend/AGENTS.md"
+
+cat > "$WD/.github/instructions/ruby.instructions.md" << 'FIXTURE'
+---
+applyTo: "**/*.rb"
+---
+Use Ruby best practices.
+FIXTURE
+
+test -f "$WD/.github/instructions/frontend/react.instructions.md" || cat > "$WD/.github/instructions/frontend/react.instructions.md" << 'FIXTURE'
+---
+applyTo: "**/*.tsx,**/*.jsx"
+---
+Use React best practices.
+FIXTURE
+
+test -f "$WD/.github/instructions/backend/api/rest.instructions.md" || cat > "$WD/.github/instructions/backend/api/rest.instructions.md" << 'FIXTURE'
+---
+applyTo: "**/*_controller.rb"
+---
+Follow REST conventions.
+FIXTURE
+
+# --- MCP configs ---
+mkdir -p "$WD/.copilot" "$WD/.vscode"
+
+test -f "$WD/.copilot/test-mcp-server.py" || cat > "$WD/.copilot/test-mcp-server.py" << 'FIXTURE'
+import sys, json
+req = json.loads(sys.stdin.readline())
+resp = {"jsonrpc":"2.0","id":req["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test-mcp","version":"0.1"}}}
+print(json.dumps(resp))
+FIXTURE
+
+cat > "$WD/.copilot/mcp-config.json" << 'FIXTURE'
+{"mcpServers":{"test-server":{"command":"python3","args":[".copilot/test-mcp-server.py"]}}}
+FIXTURE
+
+cat > "$WD/.vscode/mcp.json" << 'FIXTURE'
+{"mcpServers":{"vscode-test-server":{"command":"python3","args":[".copilot/test-mcp-server.py"]}}}
+FIXTURE
+
+# --- Skills ---
+mkdir -p "$WD/.github/skills/test-skill/scripts"
+mkdir -p "$WD/.claude/skills/deploy"
+
+cat > "$WD/.github/skills/test-skill/SKILL.md" << 'FIXTURE'
+---
+name: test-skill
+description: A test skill for integration testing
+---
+Test skill content.
+FIXTURE
+
+cat > "$WD/.github/skills/test-skill/scripts/helper.sh" << 'FIXTURE'
+#!/bin/bash
+echo "helper"
+FIXTURE
+chmod +x "$WD/.github/skills/test-skill/scripts/helper.sh"
+
+cat > "$WD/.claude/skills/deploy/SKILL.md" << 'FIXTURE'
+---
+name: deploy
+description: Deploy skill for testing
+---
+Deploy skill content.
+FIXTURE
+
+# --- Custom agents ---
+mkdir -p "$WD/.github/agents" "$WD/.claude/agents"
+
+cat > "$WD/.github/agents/reviewer.agent.md" << 'FIXTURE'
+---
+name: reviewer
+description: Code reviewer agent
+tools: ["bash", "view"]
+---
+You are a code reviewer.
+FIXTURE
+
+cat > "$WD/.claude/agents/helper.agent.md" << 'FIXTURE'
+---
+name: helper
+description: Helper agent
+---
+You are a helper.
+FIXTURE
+
+# --- Commands ---
+mkdir -p "$WD/.claude/commands"
+
+cat > "$WD/.claude/commands/test-command.md" << 'FIXTURE'
+Test command content.
+FIXTURE
+
+# --- Hooks ---
+mkdir -p "$WD/.github/hooks/scripts"
+
+cat > "$WD/.github/hooks/test-hooks.json" << 'FIXTURE'
+{"version":1,"hooks":{
+  "sessionStart":[{"type":"command","bash":".github/hooks/scripts/test-hook.sh session-start","cwd":"."}],
+  "preToolUse":[{"type":"command","bash":".github/hooks/scripts/test-hook.sh pre-tool-use","cwd":"."}]
+}}
+FIXTURE
+
+cat > "$WD/.github/hooks/scripts/test-hook.sh" << 'FIXTURE'
+#!/bin/bash
+touch "/tmp/copilot-hook-e2e-${1:-unknown}"
+cat > /dev/null 2>/dev/null || true
+echo '{"permissionDecision":"allow"}'
+FIXTURE
+chmod +x "$WD/.github/hooks/scripts/test-hook.sh"
+
+echo "fixtures-ok"
+`, wd)
+
+	out, err := exec.Command("gh", "codespace", "ssh", "-c", cs, "--", "bash", "-c", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to set up test fixtures on codespace: %v\nOutput: %s", err, string(out))
+	}
+	if !strings.Contains(string(out), "fixtures-ok") {
+		t.Fatalf("fixture setup did not complete successfully.\nOutput: %s", string(out))
 	}
 }
