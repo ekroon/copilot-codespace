@@ -44,17 +44,19 @@ copilot-codespace --model claude-sonnet-4.5
 
 ## Known limitations
 
-- **`!` shell escape runs locally** — Copilot's built-in `!` shell escape mode uses its own internal shell execution and ignores `--excluded-tools` and `$SHELL`. Commands typed via `!` will run on your local machine, not on the codespace. Use the `remote_bash` tool through the agent instead, or try the `--experimental-shell` flag (see below).
+- **`--local-shell` required for local `!` commands** — By default, `!` shell escape commands execute on the codespace via an SSH-forwarded shell patch. If you need `!` commands to run locally, pass `--local-shell`.
 
-## Experimental: remote `!` shell escape
+## Local `!` shell escape
 
 ```bash
-copilot-codespace --experimental-shell
+copilot-codespace --local-shell
 ```
 
-When this flag is set, `!` commands execute on the codespace instead of locally. This works by running copilot's JS bundle via Node.js with a monkey-patch that intercepts the `!` spawn call and redirects it over SSH (using the same multiplexed connection as the MCP tools).
+When this flag is set, `!` commands execute locally instead of on the codespace. This uses the native `copilot` binary directly (faster startup, no Node.js dependency).
 
-**Trade-offs:**
+The default behavior (without `--local-shell`) runs copilot's JS bundle via Node.js with a monkey-patch that intercepts the `!` spawn call and redirects it over SSH (using the same multiplexed connection as the MCP tools).
+
+**Trade-offs of the default (remote shell) mode:**
 - Uses the JS bundle instead of the native binary (slightly slower startup)
 - Relies on a heuristic to detect `!` spawns (`shell: true` + `stdio: "pipe"`)
 - Requires `node` (v24+) in PATH

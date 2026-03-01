@@ -69,12 +69,12 @@ func runMCPServer() {
 }
 
 func runLauncher(args []string) error {
-	// Parse --experimental-shell flag (consume it, don't pass to copilot)
-	experimentalShell := false
+	// Parse --local-shell flag (consume it, don't pass to copilot)
+	localShell := false
 	var copilotArgs []string
 	for _, arg := range args {
-		if arg == "--experimental-shell" {
-			experimentalShell = true
+		if arg == "--local-shell" {
+			localShell = true
 		} else {
 			copilotArgs = append(copilotArgs, arg)
 		}
@@ -148,18 +148,20 @@ func runLauncher(args []string) error {
 	fmt.Printf("  Codespace: %s\n", selected.Name)
 	fmt.Printf("  Workspace: %s\n", workdir)
 	fmt.Printf("  Excluded:  %d local tools\n", len(excludedTools))
-	if experimentalShell {
-		fmt.Printf("  Shell:     ! commands execute on codespace (experimental)\n")
+	if localShell {
+		fmt.Printf("  Shell:     ! commands execute locally (--local-shell)\n")
+	} else {
+		fmt.Printf("  Shell:     ! commands execute on codespace\n")
 	}
 	fmt.Printf("\n  Shell access (from another terminal):\n")
 	fmt.Printf("    gh codespace ssh -c %s\n\n", selected.Name)
 
 	// Exec copilot from the instructions dir (cwd is already set)
-	if experimentalShell {
-		// Reuse the SSH client for the shell patch (multiplexing already established)
-		return execCopilotWithShellPatch(excludedTools, mcpConfig, copilotArgs, sshClient, workdir)
+	if localShell {
+		return execCopilot(excludedTools, mcpConfig, copilotArgs)
 	}
-	return execCopilot(excludedTools, mcpConfig, copilotArgs)
+	// Default: use shell patch so "!" commands run on the codespace
+	return execCopilotWithShellPatch(excludedTools, mcpConfig, copilotArgs, sshClient, workdir)
 }
 
 // selectCodespace lets the user pick a codespace interactively.
