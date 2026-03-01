@@ -53,7 +53,7 @@ func testFetchInstructionFiles(t *testing.T, cs, wd string) (string, map[string]
 	t.Helper()
 	setupTestFixturesOnce(t, cs, wd)
 	client := testSSHClient(t, cs)
-	return fetchInstructionFiles(client, cs, wd)
+	return fetchInstructionFiles(client, cs, wd, "")
 }
 
 var fixturesReady bool
@@ -184,7 +184,7 @@ func TestIntegration_MCPConfigRewriting(t *testing.T) {
 	}
 
 	// Verify buildMCPConfig rewrites it to use gh
-	mcpConfig := buildMCPConfig("/usr/local/bin/self", cs, wd, remoteMCP)
+	mcpConfig := buildMCPConfig("/usr/local/bin/self", cs, wd, remoteMCP, "")
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(mcpConfig), &parsed); err != nil {
 		t.Fatalf("invalid merged MCP config JSON: %v", err)
@@ -548,7 +548,7 @@ func TestIntegration_MCPForwardingEndToEnd_VSCode(t *testing.T) {
 	if !ok {
 		t.Fatal("vscode-test-server config should be a map")
 	}
-	rewritten := rewriteMCPServerForSSH(serverConfig, cs, wd)
+	rewritten := rewriteMCPServerForSSH(serverConfig, cs, wd, "")
 	if rewritten == nil {
 		t.Fatal("rewriteMCPServerForSSH returned nil for vscode-test-server")
 	}
@@ -668,6 +668,78 @@ func TestIntegration_AdditionalMCPConfigs(t *testing.T) {
 	// And the vscode-test-server from .vscode/mcp.json
 	if _, ok := remoteMCP["vscode-test-server"]; !ok {
 		t.Error("missing vscode-test-server from .vscode/mcp.json")
+	}
+}
+
+func TestIntegration_DeployAndExec(t *testing.T) {
+	cs := testCodespace(t)
+
+	client := testSSHClient(t, cs)
+
+	// Deploy binary to codespace
+	remotePath, err := deployBinary(client, cs)
+	if err != nil {
+		t.Fatalf("deployBinary: %v", err)
+	}
+
+	if remotePath == "" {
+		t.Fatal("deployBinary returned empty path")
+	}
+
+	// Verify the binary exists and is executable
+	out, err := exec.Command("gh", "codespace", "ssh", "-c", cs, "--",
+		remotePath, "exec", "--workdir", "/tmp", "--", "echo", "hello-from-exec").CombinedOutput()
+	if err != nil {
+		t.Fatalf("exec on codespace failed: %v\nOutput: %s", err, string(out))
+	}
+
+	if !strings.Contains(string(out), "hello-from-exec") {
+		t.Errorf("exec output should contain 'hello-from-exec', got: %s", string(out))
+	}
+}
+
+func TestIntegration_DeployAndExecWithEnv(t *testing.T) {
+	cs := testCodespace(t)
+
+	client := testSSHClient(t, cs)
+
+	remotePath, err := deployBinary(client, cs)
+	if err != nil {
+		t.Fatalf("deployBinary: %v", err)
+	}
+
+	// Test that --env properly sets environment variables
+	out, err := exec.Command("gh", "codespace", "ssh", "-c", cs, "--",
+		remotePath, "exec", "--env", "TEST_VAR=copilot-e2e", "--", "bash", "-c", "echo $TEST_VAR").CombinedOutput()
+	if err != nil {
+		t.Fatalf("exec with env failed: %v\nOutput: %s", err, string(out))
+	}
+
+	if !strings.Contains(string(out), "copilot-e2e") {
+		t.Errorf("exec should output env var value, got: %s", string(out))
+	}
+}
+
+func TestIntegration_DeployAndExecWithWorkdir(t *testing.T) {
+	cs := testCodespace(t)
+	wd := testWorkdir(t)
+
+	client := testSSHClient(t, cs)
+
+	remotePath, err := deployBinary(client, cs)
+	if err != nil {
+		t.Fatalf("deployBinary: %v", err)
+	}
+
+	// Test that --workdir properly changes directory
+	out, err := exec.Command("gh", "codespace", "ssh", "-c", cs, "--",
+		remotePath, "exec", "--workdir", wd, "--", "pwd").CombinedOutput()
+	if err != nil {
+		t.Fatalf("exec with workdir failed: %v\nOutput: %s", err, string(out))
+	}
+
+	if !strings.Contains(string(out), wd) {
+		t.Errorf("exec should output workdir %q, got: %s", wd, string(out))
 	}
 }
 

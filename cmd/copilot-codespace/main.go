@@ -36,6 +36,15 @@ func main() {
 		return
 	}
 
+	// If first arg is "exec", run a command with workdir/env setup (used on codespace)
+	if len(os.Args) > 1 && os.Args[1] == "exec" {
+		if err := runExec(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "exec: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// Otherwise, run as interactive launcher
 	if err := runLauncher(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -114,8 +123,14 @@ func runLauncher(args []string) error {
 		fmt.Fprintf(os.Stderr, "Warning: SSH multiplexing failed, fetching will be slower: %v\n", err)
 	}
 
+	// Deploy exec agent binary to codespace for structured remote execution
+	remoteBinary, err := deployBinary(sshClient, selected.Name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not deploy exec agent, using shell fallback: %v\n", err)
+	}
+
 	// Fetch instruction files into a deterministic dir that acts as the cwd
-	instructionsDir, remoteMCPServers, err := fetchInstructionFiles(sshClient, selected.Name, workdir)
+	instructionsDir, remoteMCPServers, err := fetchInstructionFiles(sshClient, selected.Name, workdir, remoteBinary)
 	if err != nil {
 		return fmt.Errorf("fetching instructions: %w", err)
 	}
@@ -135,7 +150,7 @@ func runLauncher(args []string) error {
 
 	// Build MCP config — points to this same binary with "mcp" subcommand,
 	// plus any MCP servers from the codespace's .copilot/mcp-config.json
-	mcpConfig := buildMCPConfig(self, selected.Name, workdir, remoteMCPServers)
+	mcpConfig := buildMCPConfig(self, selected.Name, workdir, remoteMCPServers, remoteBinary)
 
 	// Excluded tools — only local file/shell tools that have remote equivalents
 	// Keep task (sub-agents), web_fetch, ask_user, sql, etc.
@@ -298,7 +313,7 @@ func execSSH(sshClient *ssh.Client, codespaceName, command string) (string, erro
 	return sshCommand(codespaceName, command)
 }
 
-func fetchInstructionFiles(sshClient *ssh.Client, codespaceName, workdir string) (string, map[string]any, error) {
+func fetchInstructionFiles(sshClient *ssh.Client, codespaceName, workdir, remoteBinary string) (string, map[string]any, error) {
 	// Use a deterministic directory so copilot only needs to trust it once per codespace
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -383,7 +398,7 @@ echo "$SEP"
 			// Rewrite hook commands to execute on the codespace via SSH.
 			// If rewriting fails, skip the file — writing the original would
 			// leave hooks that try to run scripts locally (which don't exist).
-			rewritten := rewriteHooksForSSH(content, codespaceName, workdir)
+			rewritten := rewriteHooksForSSH(content, codespaceName, workdir, remoteBinary)
 			if rewritten != nil {
 				content = rewritten
 				fmt.Printf("  ✓ %s (hooks forwarded over SSH)\n", relPath)
@@ -515,7 +530,7 @@ func ensureTrustedFolder(dir string) error {
 	return os.WriteFile(configPath, out, 0o644)
 }
 
-func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers map[string]any) string {
+func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers map[string]any, remoteBinary string) string {
 	servers := map[string]any{
 		"codespace": map[string]any{
 			"type":    "local",
@@ -535,7 +550,7 @@ func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers 
 			continue // don't override our own server
 		}
 		if server, ok := serverConfig.(map[string]any); ok {
-			rewritten := rewriteMCPServerForSSH(server, codespaceName, workdir)
+			rewritten := rewriteMCPServerForSSH(server, codespaceName, workdir, remoteBinary)
 			if rewritten != nil {
 				servers[name] = rewritten
 			}
@@ -550,14 +565,45 @@ func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers 
 }
 
 // rewriteMCPServerForSSH rewrites an MCP server config to forward its stdio over SSH.
-// The original command is executed on the codespace via gh codespace ssh.
-func rewriteMCPServerForSSH(server map[string]any, codespaceName, workdir string) map[string]any {
+// When remoteBinary is available, uses structured exec args instead of shell assembly.
+func rewriteMCPServerForSSH(server map[string]any, codespaceName, workdir, remoteBinary string) map[string]any {
 	command, _ := server["command"].(string)
 	if command == "" {
 		return nil
 	}
 
-	// Build the remote command string
+	// When remote binary is deployed, use structured exec (no shell escaping needed)
+	if remoteBinary != "" {
+		args := []string{"codespace", "ssh", "-c", codespaceName, "--",
+			remoteBinary, "exec", "--workdir", workdir}
+
+		// Add env vars as structured flags
+		if env, ok := server["env"].(map[string]any); ok {
+			for k, v := range env {
+				if s, ok := v.(string); ok {
+					args = append(args, "--env", k+"="+s)
+				}
+			}
+		}
+
+		// Add command and its args after --
+		args = append(args, "--", command)
+		if cmdArgs, ok := server["args"].([]any); ok {
+			for _, arg := range cmdArgs {
+				if s, ok := arg.(string); ok {
+					args = append(args, s)
+				}
+			}
+		}
+
+		return map[string]any{
+			"type":    "local",
+			"command": "gh",
+			"args":    args,
+		}
+	}
+
+	// Fallback: shell assembly (when remote binary not available)
 	remoteCmd := command
 	if args, ok := server["args"].([]any); ok {
 		for _, arg := range args {
@@ -567,7 +613,6 @@ func rewriteMCPServerForSSH(server map[string]any, codespaceName, workdir string
 		}
 	}
 
-	// Prepend env vars and cd to workdir
 	envPrefix := fmt.Sprintf("cd %s", workdir)
 	if env, ok := server["env"].(map[string]any); ok {
 		for k, v := range env {
@@ -586,10 +631,9 @@ func rewriteMCPServerForSSH(server map[string]any, codespaceName, workdir string
 }
 
 // rewriteHooksForSSH rewrites hook commands in a hooks JSON file to execute
-// on the codespace via SSH. Each hook's bash command is wrapped in an SSH call
-// so scripts run remotely. Stdin/stdout piping through SSH preserves
-// preToolUse allow/deny behavior.
-func rewriteHooksForSSH(content []byte, codespaceName, workdir string) []byte {
+// on the codespace via SSH. When remoteBinary is available, uses structured
+// exec args. Otherwise falls back to shell assembly.
+func rewriteHooksForSSH(content []byte, codespaceName, workdir, remoteBinary string) []byte {
 	var config map[string]any
 	if err := json.Unmarshal(content, &config); err != nil {
 		return nil
@@ -622,18 +666,32 @@ func rewriteHooksForSSH(content []byte, codespaceName, workdir string) []byte {
 				remoteCwd = workdir + "/" + cwd
 			}
 
-			// Build env export prefix
-			envPrefix := ""
-			if env, ok := h["env"].(map[string]any); ok {
-				for k, v := range env {
-					if s, ok := v.(string); ok {
-						envPrefix += fmt.Sprintf("export %s=%s && ", k, shellQuote(s))
+			if remoteBinary != "" {
+				// Structured exec via remote binary (no shell escaping)
+				execArgs := remoteBinary + " exec --workdir " + remoteCwd
+				if env, ok := h["env"].(map[string]any); ok {
+					for k, v := range env {
+						if s, ok := v.(string); ok {
+							execArgs += " --env " + k + "=" + s
+						}
 					}
 				}
+				execArgs += " -- bash -c " + shellQuote(bashCmd)
+				h["bash"] = fmt.Sprintf("gh codespace ssh -c %s -- %s", codespaceName, execArgs)
+			} else {
+				// Fallback: shell assembly
+				envPrefix := ""
+				if env, ok := h["env"].(map[string]any); ok {
+					for k, v := range env {
+						if s, ok := v.(string); ok {
+							envPrefix += fmt.Sprintf("export %s=%s && ", k, shellQuote(s))
+						}
+					}
+				}
+				remoteCmd := fmt.Sprintf("cd %s && %s%s", shellQuote(remoteCwd), envPrefix, bashCmd)
+				h["bash"] = fmt.Sprintf("gh codespace ssh -c %s -- bash -c %s", codespaceName, shellQuote(remoteCmd))
 			}
 
-			remoteCmd := fmt.Sprintf("cd %s && %s%s", shellQuote(remoteCwd), envPrefix, bashCmd)
-			h["bash"] = fmt.Sprintf("gh codespace ssh -c %s -- bash -c %s", codespaceName, shellQuote(remoteCmd))
 			// Clear cwd and env since they're baked into the SSH command
 			delete(h, "cwd")
 			delete(h, "env")

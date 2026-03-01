@@ -8,7 +8,7 @@ import (
 )
 
 func TestBuildMCPConfig(t *testing.T) {
-	result := buildMCPConfig("/usr/local/bin/self", "my-codespace", "/workspaces/repo", nil)
+	result := buildMCPConfig("/usr/local/bin/self", "my-codespace", "/workspaces/repo", nil, "")
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -54,7 +54,7 @@ func TestBuildMCPConfigWithRemoteServers(t *testing.T) {
 		},
 	}
 
-	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP)
+	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP, "")
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -81,7 +81,7 @@ func TestBuildMCPConfigRemoteCannotOverrideCodespace(t *testing.T) {
 		},
 	}
 
-	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP)
+	result := buildMCPConfig("/usr/local/bin/self", "cs", "/workspaces/repo", remoteMCP, "")
 
 	var parsed map[string]any
 	json.Unmarshal([]byte(result), &parsed)
@@ -105,7 +105,7 @@ func TestRewriteMCPServerForSSH(t *testing.T) {
 		},
 	}
 
-	result := rewriteMCPServerForSSH(server, "my-cs", "/workspaces/repo")
+	result := rewriteMCPServerForSSH(server, "my-cs", "/workspaces/repo", "")
 
 	if result == nil {
 		t.Fatal("rewriteMCPServerForSSH returned nil")
@@ -312,7 +312,7 @@ func TestRewriteHooksForSSH(t *testing.T) {
 		}
 	}`
 
-	result := rewriteHooksForSSH([]byte(hooksJSON), "my-cs", "/workspaces/repo")
+	result := rewriteHooksForSSH([]byte(hooksJSON), "my-cs", "/workspaces/repo", "")
 	if result == nil {
 		t.Fatal("rewriteHooksForSSH returned nil")
 	}
@@ -363,14 +363,14 @@ func TestRewriteHooksForSSH(t *testing.T) {
 }
 
 func TestRewriteHooksForSSH_NoHooks(t *testing.T) {
-	result := rewriteHooksForSSH([]byte(`{"version": 1}`), "cs", "/workspaces/repo")
+	result := rewriteHooksForSSH([]byte(`{"version": 1}`), "cs", "/workspaces/repo", "")
 	if result != nil {
 		t.Error("expected nil for config with no hooks")
 	}
 }
 
 func TestRewriteHooksForSSH_InvalidJSON(t *testing.T) {
-	result := rewriteHooksForSSH([]byte(`{invalid`), "cs", "/workspaces/repo")
+	result := rewriteHooksForSSH([]byte(`{invalid`), "cs", "/workspaces/repo", "")
 	if result != nil {
 		t.Error("expected nil for invalid JSON")
 	}

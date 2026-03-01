@@ -13,17 +13,24 @@ Integration tests require a real codespace and `gh` CLI auth — run `./scripts/
 
 ## Architecture
 
-Single Go binary that operates in two modes, selected by the first argument:
+Single Go binary that operates in three modes, selected by the first argument:
 
 1. **Launcher** (`copilot-codespace [flags]`) — `cmd/copilot-codespace/main.go`
    - Lists codespaces via `gh`, picks one, starts it if stopped
-   - Fetches instruction files (`.github/copilot-instructions.md`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) from the codespace into a local temp dir
+   - Deploys exec agent binary to the codespace (`deploy.go`)
+   - Fetches project-level components (instructions, skills, agents, commands, hooks, MCP configs) into a local mirror dir
+   - Rewrites MCP servers and hooks for SSH forwarding (using remote exec agent when available)
    - Execs `copilot` with `--excluded-tools` (disabling 10 local file/shell tools) and `--additional-mcp-config` (adding itself as the MCP server)
 
 2. **MCP server** (`copilot-codespace mcp`) — `internal/mcp/server.go`
    - Spawned by Copilot CLI as a child process, communicates via stdio JSON-RPC
    - Provides `remote_*` tools (view, edit, create, bash, grep, glob, write/read/stop/list_bash) that mirror Copilot's built-in local tools
    - Delegates all operations to `ssh.Executor` interface
+
+3. **Exec agent** (`copilot-codespace exec`) — `cmd/copilot-codespace/exec.go`
+   - Deployed to codespace at startup, used for structured remote command execution
+   - `exec [--workdir DIR] [--env K=V]... -- COMMAND [ARGS...]`
+   - Replaces fragile `bash -c 'cd WD && export K=V && exec CMD'` shell assembly with proper Go process management
 
 Key packages:
 - `internal/ssh` — `Client` implements `Executor` by running commands over SSH (via `gh codespace ssh` or multiplexed ControlMaster). Async sessions use tmux on the codespace.

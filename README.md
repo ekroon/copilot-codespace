@@ -4,17 +4,18 @@ Launch Copilot CLI with all file/bash operations executing on a remote GitHub Co
 
 ## How it works
 
-A single Go binary (`copilot-codespace`) serves two roles:
+A single Go binary (`copilot-codespace`) serves three roles:
 
-1. **Launcher mode** (default) — Lists your codespaces, lets you pick one, starts it if needed, fetches instruction files and project-level components, then launches `copilot` with:
+1. **Launcher mode** (default) — Lists your codespaces, lets you pick one, starts it if needed, deploys the exec agent, fetches instruction files and project-level components, then launches `copilot` with:
    - `--excluded-tools` — disables 11 built-in local tools
    - `--additional-mcp-config` — adds itself as the MCP server (plus any remote MCP configs)
-   - `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` — points to fetched remote instruction files
 
 2. **MCP server mode** (`copilot-codespace mcp`) — Spawned by copilot, provides 10 remote tools over SSH:
    - `remote_view`, `remote_edit`, `remote_create` — file operations
    - `remote_bash` (sync + async), `remote_grep`, `remote_glob` — commands & search
    - `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash` — async session management (tmux-based)
+
+3. **Exec agent** (`copilot-codespace exec`) — Deployed to the codespace at startup. Provides structured command execution with workdir/env setup, replacing fragile shell escaping in SSH forwarding.
 
 ## Prerequisites
 
