@@ -78,14 +78,19 @@ func runMCPServer() {
 }
 
 func runLauncher(args []string) error {
-	// Parse --local-shell flag (consume it, don't pass to copilot)
+	// Parse our flags (consume them, don't pass to copilot)
 	localShell := false
+	codespaceName := ""
 	var copilotArgs []string
-	for _, arg := range args {
-		if arg == "--local-shell" {
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--local-shell":
 			localShell = true
-		} else {
-			copilotArgs = append(copilotArgs, arg)
+		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
+			codespaceName = args[i+1]
+			i++
+		default:
+			copilotArgs = append(copilotArgs, args[i])
 		}
 	}
 
@@ -95,8 +100,13 @@ func runLauncher(args []string) error {
 		return fmt.Errorf("finding executable: %w", err)
 	}
 
-	// Use gh's built-in interactive codespace picker
-	selected, err := selectCodespace()
+	// Select codespace: use --codespace flag or interactive picker
+	var selected codespace
+	if codespaceName != "" {
+		selected, err = lookupCodespace(codespaceName)
+	} else {
+		selected, err = selectCodespace()
+	}
 	if err != nil {
 		return err
 	}
@@ -177,6 +187,34 @@ func runLauncher(args []string) error {
 	}
 	// Default: use shell patch so "!" commands run on the codespace
 	return execCopilotWithShellPatch(excludedTools, mcpConfig, copilotArgs, sshClient, workdir)
+}
+
+// lookupCodespace finds a codespace by name (exact or prefix match).
+func lookupCodespace(name string) (codespace, error) {
+	out, err := exec.Command("gh", "codespace", "list",
+		"--json", "name,displayName,repository,state",
+		"--limit", "50").Output()
+	if err != nil {
+		return codespace{}, fmt.Errorf("listing codespaces: %w", err)
+	}
+
+	var codespaces []codespace
+	if err := json.Unmarshal(out, &codespaces); err != nil {
+		return codespace{}, fmt.Errorf("parsing codespace list: %w", err)
+	}
+
+	// Try exact match first, then prefix match
+	for _, cs := range codespaces {
+		if cs.Name == name {
+			return cs, nil
+		}
+	}
+	for _, cs := range codespaces {
+		if strings.HasPrefix(cs.Name, name) || strings.HasPrefix(cs.DisplayName, name) {
+			return cs, nil
+		}
+	}
+	return codespace{}, fmt.Errorf("codespace %q not found", name)
 }
 
 // selectCodespace lets the user pick a codespace interactively.
