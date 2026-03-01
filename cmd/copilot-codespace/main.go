@@ -169,6 +169,12 @@ func runLauncher(args []string) error {
 		"stop_bash", "list_bash", "view", "grep", "glob",
 	}
 
+	// Forward IDE connections from codespace so copilot can auto-connect
+	_, err = forwardIDEConnections(sshClient, selected.Name, instructionsDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: IDE forwarding failed: %v\n", err)
+	}
+
 	fmt.Printf("\nLaunching Copilot CLI with remote codespace tools...\n")
 	fmt.Printf("  Codespace: %s\n", selected.Name)
 	fmt.Printf("  Workspace: %s\n", workdir)

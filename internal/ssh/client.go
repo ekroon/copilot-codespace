@@ -528,6 +528,35 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
+// ForwardSocket sets up Unix socket forwarding from a local path to a remote path
+// using the existing SSH ControlMaster connection. The forwarding persists as long
+// as the master connection is alive. Returns an error if multiplexing is not active.
+func (c *Client) ForwardSocket(ctx context.Context, localPath, remotePath string) error {
+	if c.sshConfigPath == "" {
+		return fmt.Errorf("SSH multiplexing not active, cannot forward socket")
+	}
+
+	// Remove stale local socket if it exists
+	if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing stale socket %s: %w", localPath, err)
+	}
+
+	// StreamLocalBindUnlink=yes tells SSH to remove the socket atomically before
+	// binding, avoiding a TOCTOU race between our Remove and the bind.
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-F", c.sshConfigPath,
+		"-o", "StreamLocalBindUnlink=yes",
+		"-O", "forward",
+		"-L", localPath+":"+remotePath,
+		c.sshHost,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ssh forward: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
 func pathDir(path string) string {
 	i := strings.LastIndex(path, "/")
 	if i < 0 {
