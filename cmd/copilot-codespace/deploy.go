@@ -198,7 +198,7 @@ func downloadReleaseBinary(arch string) (string, func(), error) {
 	pattern := fmt.Sprintf("copilot-codespace-linux-%s", arch)
 	outPath := filepath.Join(tmpDir, "copilot-codespace")
 
-	cmd := exec.Command("gh", "release", "download", "latest",
+	cmd := exec.Command("gh", "release", "download",
 		"--repo", "ekroon/copilot-codespace",
 		"--pattern", pattern,
 		"--output", outPath)
