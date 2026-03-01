@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -106,8 +107,15 @@ func runLauncher(args []string) error {
 	}
 	fmt.Printf("Workspace: %s\n", workdir)
 
+	// Set up SSH multiplexing early for fast file fetching (~0.1s vs ~3s per call)
+	sshClient := ssh.NewClient(selected.Name)
+	ctx := context.Background()
+	if err := sshClient.SetupMultiplexing(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: SSH multiplexing failed, fetching will be slower: %v\n", err)
+	}
+
 	// Fetch instruction files into a deterministic dir that acts as the cwd
-	instructionsDir, err := fetchInstructionFiles(selected.Name, workdir)
+	instructionsDir, remoteMCPServers, err := fetchInstructionFiles(sshClient, selected.Name, workdir)
 	if err != nil {
 		return fmt.Errorf("fetching instructions: %w", err)
 	}
@@ -125,8 +133,9 @@ func runLauncher(args []string) error {
 		return fmt.Errorf("changing to instructions dir: %w", err)
 	}
 
-	// Build MCP config — points to this same binary with "mcp" subcommand
-	mcpConfig := buildMCPConfig(self, selected.Name, workdir)
+	// Build MCP config — points to this same binary with "mcp" subcommand,
+	// plus any MCP servers from the codespace's .copilot/mcp-config.json
+	mcpConfig := buildMCPConfig(self, selected.Name, workdir, remoteMCPServers)
 
 	// Excluded tools — only local file/shell tools that have remote equivalents
 	// Keep task (sub-agents), web_fetch, ask_user, sql, etc.
@@ -147,12 +156,7 @@ func runLauncher(args []string) error {
 
 	// Exec copilot from the instructions dir (cwd is already set)
 	if experimentalShell {
-		// Get SSH connection details for the shell patch
-		sshClient := ssh.NewClient(selected.Name)
-		ctx := context.Background()
-		if err := sshClient.SetupMultiplexing(ctx); err != nil {
-			return fmt.Errorf("setting up SSH for shell patch: %w", err)
-		}
+		// Reuse the SSH client for the shell patch (multiplexing already established)
 		return execCopilotWithShellPatch(excludedTools, mcpConfig, copilotArgs, sshClient, workdir)
 	}
 	return execCopilot(excludedTools, mcpConfig, copilotArgs)
@@ -275,80 +279,161 @@ func sshCommand(codespaceName, command string) (string, error) {
 	return string(out), nil
 }
 
-func fetchInstructionFiles(codespaceName, workdir string) (string, error) {
+// execSSH runs a command on the codespace using the multiplexed SSH client.
+// Falls back to gh codespace ssh if the client has no multiplexing.
+func execSSH(sshClient *ssh.Client, codespaceName, command string) (string, error) {
+	if sshClient != nil {
+		ctx := context.Background()
+		stdout, stderr, exitCode, err := sshClient.Exec(ctx, command)
+		if err != nil {
+			return "", err
+		}
+		if exitCode != 0 {
+			return "", fmt.Errorf("exit %d: %s", exitCode, strings.TrimSpace(stderr))
+		}
+		return stdout, nil
+	}
+	return sshCommand(codespaceName, command)
+}
+
+func fetchInstructionFiles(sshClient *ssh.Client, codespaceName, workdir string) (string, map[string]any, error) {
 	// Use a deterministic directory so copilot only needs to trust it once per codespace
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("getting home dir: %w", err)
+		return "", nil, fmt.Errorf("getting home dir: %w", err)
 	}
 	baseDir := filepath.Join(homeDir, ".copilot", "codespace-workdirs", codespaceName)
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
-		return "", fmt.Errorf("creating workdir: %w", err)
+		return "", nil, fmt.Errorf("creating workdir: %w", err)
 	}
-	// Clean existing instruction files so stale ones don't persist
-	os.RemoveAll(filepath.Join(baseDir, ".github"))
-	os.Remove(filepath.Join(baseDir, "AGENTS.md"))
-	os.Remove(filepath.Join(baseDir, "CLAUDE.md"))
-	os.Remove(filepath.Join(baseDir, "GEMINI.md"))
+	// Clean all contents except .git/ so stale instruction files don't persist
+	cleanMirrorDir(baseDir)
 
 	fmt.Println("Fetching instruction files from codespace...")
 
-	// Fetch known instruction files
-	knownFiles := []string{
-		".github/copilot-instructions.md",
-		"AGENTS.md",
-		"CLAUDE.md",
-		"GEMINI.md",
+	// Discover and fetch ALL instruction files in a single SSH call.
+	// Each file is output as: ===FILE_BOUNDARY===\n<relpath>\n<base64-content>
+	batchScript := fmt.Sprintf(`
+WD=%s
+SEP="===FILE_BOUNDARY==="
+files=(
+  $(test -f "$WD/.github/copilot-instructions.md" && echo "$WD/.github/copilot-instructions.md")
+  $(find "$WD/.github/instructions" -name '*.instructions.md' 2>/dev/null)
+  $(find "$WD" \( -name 'AGENTS.md' -o -name 'CLAUDE.md' -o -name 'GEMINI.md' \) 2>/dev/null | grep -v '/\.git/')
+  $(test -f "$WD/.copilot/mcp-config.json" && echo "$WD/.copilot/mcp-config.json")
+)
+for f in "${files[@]}"; do
+  echo "$SEP"
+  echo "${f#$WD/}"
+  base64 < "$f"
+done
+echo "$SEP"
+`, shellQuote(workdir))
+
+	output, err := execSSH(sshClient, codespaceName, batchScript)
+	if err != nil {
+		// Non-fatal: continue with empty mirror
+		fmt.Fprintf(os.Stderr, "Warning: failed to fetch instruction files: %v\n", err)
+		return baseDir, nil, nil
 	}
 
-	for _, relPath := range knownFiles {
-		remotePath := workdir + "/" + relPath
-		// Check if file exists
-		if exec.Command("gh", "codespace", "ssh", "-c", codespaceName,
-			"--", fmt.Sprintf("test -f %s", remotePath)).Run() != nil {
-			continue
-		}
-		// Fetch it
-		content, err := sshCommand(codespaceName, fmt.Sprintf("cat %s", remotePath))
-		if err != nil {
+	// Parse batched output and write files
+	var remoteMCPConfig map[string]any
+	files := parseBatchedOutput(output, workdir)
+	for relPath, content := range files {
+		if relPath == ".copilot/mcp-config.json" {
+			// Parse MCP config for server rewriting instead of writing to mirror
+			remoteMCPConfig = parseMCPConfigJSON(content)
+			if remoteMCPConfig != nil {
+				for name := range remoteMCPConfig {
+					fmt.Printf("  ✓ MCP server: %s (forwarded over SSH)\n", name)
+				}
+			}
 			continue
 		}
 		localPath := filepath.Join(baseDir, relPath)
 		if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 			continue
 		}
-		if err := os.WriteFile(localPath, []byte(content), 0o644); err != nil {
+		if err := os.WriteFile(localPath, content, 0o644); err != nil {
 			continue
 		}
 		fmt.Printf("  ✓ %s\n", relPath)
 	}
 
-	// Fetch scoped instruction files
-	scopedOutput, err := sshCommand(codespaceName,
-		fmt.Sprintf("find %s/.github/instructions -name '*.instructions.md' 2>/dev/null", workdir))
-	if err == nil && strings.TrimSpace(scopedOutput) != "" {
-		for _, remotePath := range strings.Split(strings.TrimSpace(scopedOutput), "\n") {
-			remotePath = strings.TrimSpace(remotePath)
-			if remotePath == "" {
-				continue
-			}
-			relPath := strings.TrimPrefix(remotePath, workdir+"/")
-			content, err := sshCommand(codespaceName, fmt.Sprintf("cat %s", remotePath))
-			if err != nil {
-				continue
-			}
-			localPath := filepath.Join(baseDir, relPath)
-			if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
-				continue
-			}
-			if err := os.WriteFile(localPath, []byte(content), 0o644); err != nil {
-				continue
-			}
-			fmt.Printf("  ✓ %s\n", relPath)
+	return baseDir, remoteMCPConfig, nil
+}
+
+const fileBoundary = "===FILE_BOUNDARY==="
+
+// parseBatchedOutput parses the boundary-delimited output from the batch fetch script.
+// Returns a map of relative paths to file contents (decoded from base64).
+func parseBatchedOutput(output, workdir string) map[string][]byte {
+	files := make(map[string][]byte)
+	parts := strings.Split(output, fileBoundary)
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
 		}
+		// First line is the relative path, rest is base64-encoded content
+		lines := strings.SplitN(part, "\n", 2)
+		if len(lines) < 2 {
+			continue
+		}
+		relPath := strings.TrimSpace(lines[0])
+		b64Content := strings.TrimSpace(lines[1])
+		if relPath == "" || b64Content == "" {
+			continue
+		}
+
+		decoded, err := base64.StdEncoding.DecodeString(b64Content)
+		if err != nil {
+			continue
+		}
+		files[relPath] = decoded
 	}
 
-	return baseDir, nil
+	return files
+}
+
+// parseMCPConfigJSON parses .copilot/mcp-config.json content and rewrites servers for SSH forwarding.
+func parseMCPConfigJSON(content []byte) map[string]any {
+	var config map[string]any
+	if err := json.Unmarshal(content, &config); err != nil {
+		return nil
+	}
+	servers, ok := config["mcpServers"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	// The caller (buildMCPConfig) handles the rewriting via rewriteMCPServerForSSH
+	rewritten := make(map[string]any)
+	for name, raw := range servers {
+		if server, ok := raw.(map[string]any); ok {
+			rewritten[name] = server
+		}
+	}
+	if len(rewritten) == 0 {
+		return nil
+	}
+	return rewritten
+}
+
+// cleanMirrorDir removes all contents of the mirror directory except .git/,
+// ensuring stale instruction files don't persist across fetches.
+func cleanMirrorDir(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.Name() == ".git" {
+			continue
+		}
+		os.RemoveAll(filepath.Join(dir, e.Name()))
+	}
 }
 
 // ensureTrustedFolder adds the directory to copilot's trusted_folders config if not already present.
@@ -388,23 +473,78 @@ func ensureTrustedFolder(dir string) error {
 	return os.WriteFile(configPath, out, 0o644)
 }
 
-func buildMCPConfig(selfBinary, codespaceName, workdir string) string {
-	config := map[string]any{
-		"mcpServers": map[string]any{
-			"codespace": map[string]any{
-				"type":    "local",
-				"command": selfBinary,
-				"args":    []string{"mcp"},
-				"env": map[string]string{
-					"CODESPACE_NAME":    codespaceName,
-					"CODESPACE_WORKDIR": workdir,
-				},
-				"tools": []string{"*"},
+func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers map[string]any) string {
+	servers := map[string]any{
+		"codespace": map[string]any{
+			"type":    "local",
+			"command": selfBinary,
+			"args":    []string{"mcp"},
+			"env": map[string]string{
+				"CODESPACE_NAME":    codespaceName,
+				"CODESPACE_WORKDIR": workdir,
 			},
+			"tools": []string{"*"},
 		},
+	}
+
+	// Merge remote MCP servers (rewritten to forward over SSH)
+	for name, serverConfig := range remoteMCPServers {
+		if name == "codespace" {
+			continue // don't override our own server
+		}
+		if server, ok := serverConfig.(map[string]any); ok {
+			rewritten := rewriteMCPServerForSSH(server, codespaceName, workdir)
+			if rewritten != nil {
+				servers[name] = rewritten
+			}
+		}
+	}
+
+	config := map[string]any{
+		"mcpServers": servers,
 	}
 	b, _ := json.Marshal(config)
 	return string(b)
+}
+
+// rewriteMCPServerForSSH rewrites an MCP server config to forward its stdio over SSH.
+// The original command is executed on the codespace via gh codespace ssh.
+func rewriteMCPServerForSSH(server map[string]any, codespaceName, workdir string) map[string]any {
+	command, _ := server["command"].(string)
+	if command == "" {
+		return nil
+	}
+
+	// Build the remote command string
+	remoteCmd := command
+	if args, ok := server["args"].([]any); ok {
+		for _, arg := range args {
+			if s, ok := arg.(string); ok {
+				remoteCmd += " " + s
+			}
+		}
+	}
+
+	// Prepend env vars and cd to workdir
+	envPrefix := fmt.Sprintf("cd %s", workdir)
+	if env, ok := server["env"].(map[string]any); ok {
+		for k, v := range env {
+			if s, ok := v.(string); ok {
+				envPrefix += fmt.Sprintf(" && export %s=%s", k, s)
+			}
+		}
+	}
+	remoteCmd = envPrefix + " && exec " + remoteCmd
+
+	return map[string]any{
+		"type":    "local",
+		"command": "gh",
+		"args":    []string{"codespace", "ssh", "-c", codespaceName, "--", "bash", "-c", remoteCmd},
+	}
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
 func execCopilot(excludedTools []string, mcpConfig string, extraArgs []string) error {
