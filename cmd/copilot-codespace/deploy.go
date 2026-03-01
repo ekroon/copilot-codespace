@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -53,21 +54,20 @@ func deployBinary(sshClient *ssh.Client, codespaceName string) (string, error) {
 		defer cleanup()
 	}
 
-	// Create target directory and copy binary via SSH
-	mkdirCmd := fmt.Sprintf("mkdir -p %s", remoteBinaryDir)
-	if _, err := sshCommand(codespaceName, mkdirCmd); err != nil {
-		return "", fmt.Errorf("creating remote dir: %w", err)
+	// Transfer via base64 over SSH (gh codespace cp uses SCP which is unreliable)
+	binData, err := os.ReadFile(linuxBinary)
+	if err != nil {
+		return "", fmt.Errorf("reading binary: %w", err)
 	}
 
-	// Copy via gh codespace cp
-	if err := exec.Command("gh", "codespace", "cp", "-c", codespaceName,
-		linuxBinary, "remote:"+remotePath).Run(); err != nil {
-		return "", fmt.Errorf("copying binary to codespace: %w", err)
-	}
+	encoded := base64.StdEncoding.EncodeToString(binData)
+	installCmd := fmt.Sprintf("mkdir -p %s && base64 -d > %s && chmod +x %s",
+		remoteBinaryDir, remotePath, remotePath)
 
-	// Make executable
-	if _, err := sshCommand(codespaceName, "chmod +x "+remotePath); err != nil {
-		return "", fmt.Errorf("chmod: %w", err)
+	cmd := exec.Command("gh", "codespace", "ssh", "-c", codespaceName, "--", installCmd)
+	cmd.Stdin = strings.NewReader(encoded)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("copying binary to codespace: %w: %s", err, out)
 	}
 
 	fmt.Printf("  ✓ Deployed exec agent (%s)\n", arch)

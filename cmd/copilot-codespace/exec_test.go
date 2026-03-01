@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -116,11 +117,15 @@ func TestRewriteMCPServerForSSH_FallbackWithoutBinary(t *testing.T) {
 
 	args := result["args"].([]string)
 
-	// Should use bash -c fallback
+	// Should use bash -c fallback with quoted command
 	foundBash := false
 	for i, a := range args {
 		if a == "bash" && i+1 < len(args) && args[i+1] == "-c" {
 			foundBash = true
+			// The command after -c should be shell-quoted (single quotes)
+			if i+2 < len(args) && !strings.HasPrefix(args[i+2], "'") {
+				t.Errorf("bash -c command should be shell-quoted, got %q", args[i+2])
+			}
 			break
 		}
 	}

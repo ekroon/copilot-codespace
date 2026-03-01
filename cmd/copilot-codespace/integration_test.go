@@ -710,7 +710,7 @@ func TestIntegration_DeployAndExecWithEnv(t *testing.T) {
 
 	// Test that --env properly sets environment variables
 	out, err := exec.Command("gh", "codespace", "ssh", "-c", cs, "--",
-		remotePath, "exec", "--env", "TEST_VAR=copilot-e2e", "--", "bash", "-c", "echo $TEST_VAR").CombinedOutput()
+		remotePath, "exec", "--env", "TEST_VAR=copilot-e2e", "--", "printenv", "TEST_VAR").CombinedOutput()
 	if err != nil {
 		t.Fatalf("exec with env failed: %v\nOutput: %s", err, string(out))
 	}

@@ -626,7 +626,7 @@ func rewriteMCPServerForSSH(server map[string]any, codespaceName, workdir, remot
 	return map[string]any{
 		"type":    "local",
 		"command": "gh",
-		"args":    []string{"codespace", "ssh", "-c", codespaceName, "--", "bash", "-c", remoteCmd},
+		"args":    []string{"codespace", "ssh", "-c", codespaceName, "--", "bash", "-c", shellQuote(remoteCmd)},
 	}
 }
 
@@ -668,15 +668,17 @@ func rewriteHooksForSSH(content []byte, codespaceName, workdir, remoteBinary str
 
 			if remoteBinary != "" {
 				// Structured exec via remote binary (no shell escaping)
-				execArgs := remoteBinary + " exec --workdir " + remoteCwd
+				// Double-quote the bash command: once for local shell (which consumes
+				// the hook's bash field), once for the remote shell (SSH).
+				execArgs := remoteBinary + " exec --workdir " + shellQuote(remoteCwd)
 				if env, ok := h["env"].(map[string]any); ok {
 					for k, v := range env {
 						if s, ok := v.(string); ok {
-							execArgs += " --env " + k + "=" + s
+							execArgs += " --env " + shellQuote(k+"="+s)
 						}
 					}
 				}
-				execArgs += " -- bash -c " + shellQuote(bashCmd)
+				execArgs += " -- bash -c " + shellQuote(shellQuote(bashCmd))
 				h["bash"] = fmt.Sprintf("gh codespace ssh -c %s -- %s", codespaceName, execArgs)
 			} else {
 				// Fallback: shell assembly
@@ -689,7 +691,7 @@ func rewriteHooksForSSH(content []byte, codespaceName, workdir, remoteBinary str
 					}
 				}
 				remoteCmd := fmt.Sprintf("cd %s && %s%s", shellQuote(remoteCwd), envPrefix, bashCmd)
-				h["bash"] = fmt.Sprintf("gh codespace ssh -c %s -- bash -c %s", codespaceName, shellQuote(remoteCmd))
+				h["bash"] = fmt.Sprintf("gh codespace ssh -c %s -- bash -c %s", codespaceName, shellQuote(shellQuote(remoteCmd)))
 			}
 
 			// Clear cwd and env since they're baked into the SSH command
