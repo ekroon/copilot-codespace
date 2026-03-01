@@ -57,6 +57,25 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 	c.controlSocket = filepath.Join(configDir, ".ssh-"+c.codespaceName)
 	c.sshConfigPath = filepath.Join(configDir, ".ssh-config-"+c.codespaceName)
 
+	// Reuse existing multiplexed connection if alive (e.g., set up by the launcher).
+	// Avoids calling gh codespace ssh --config which creates a new tunnel and may
+	// invalidate the existing ControlMaster's connection and its socket forwardings.
+	if data, err := os.ReadFile(c.sshConfigPath); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "Host ") {
+				c.sshHost = strings.TrimPrefix(strings.TrimSpace(line), "Host ")
+				break
+			}
+		}
+		if c.sshHost != "" {
+			check := exec.CommandContext(ctx, "ssh", "-F", c.sshConfigPath, "-O", "check", c.sshHost)
+			if check.Run() == nil {
+				fmt.Fprintf(os.Stderr, "codespace-mcp: reusing existing SSH multiplexing\n")
+				return nil
+			}
+		}
+	}
+
 	// Get SSH config from gh (contains ProxyCommand, identity file, etc.)
 	ghConfig, err := exec.CommandContext(ctx, "gh", "codespace", "ssh",
 		"--config", "-c", c.codespaceName).Output()

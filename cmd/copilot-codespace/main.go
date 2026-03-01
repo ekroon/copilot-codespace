@@ -153,6 +153,15 @@ func runLauncher(args []string) error {
 	// Initialize as git repo so copilot treats it as a repo root and loads instructions
 	exec.Command("git", "-C", instructionsDir, "init", "-q").Run()
 
+	// Set local branch to match the codespace's current branch
+	branch := detectRemoteBranch(sshClient, selected.Name, workdir)
+	if branch != "" {
+		exec.Command("git", "-C", instructionsDir, "symbolic-ref", "HEAD", "refs/heads/"+branch).Run()
+	}
+
+	// Generate a postToolUse hook to keep the branch in sync when the agent switches branches
+	generateBranchSyncHook(instructionsDir, selected.Name, workdir, sshClient)
+
 	// Change to the instructions dir so copilot finds the instruction files
 	if err := os.Chdir(instructionsDir); err != nil {
 		return fmt.Errorf("changing to instructions dir: %w", err)
@@ -178,6 +187,9 @@ func runLauncher(args []string) error {
 	fmt.Printf("\nLaunching Copilot CLI with remote codespace tools...\n")
 	fmt.Printf("  Codespace: %s\n", selected.Name)
 	fmt.Printf("  Workspace: %s\n", workdir)
+	if branch != "" {
+		fmt.Printf("  Branch:    %s\n", branch)
+	}
 	fmt.Printf("  Excluded:  %d local tools\n", len(excludedTools))
 	if localShell {
 		fmt.Printf("  Shell:     ! commands execute locally (--local-shell)\n")
@@ -192,7 +204,7 @@ func runLauncher(args []string) error {
 		return execCopilot(excludedTools, mcpConfig, copilotArgs)
 	}
 	// Default: use shell patch so "!" commands run on the codespace
-	return execCopilotWithShellPatch(excludedTools, mcpConfig, copilotArgs, sshClient, workdir)
+	return execCopilotWithShellPatch(excludedTools, mcpConfig, copilotArgs, sshClient, workdir, instructionsDir)
 }
 
 // lookupCodespace finds a codespace by name (exact or prefix match).
@@ -782,7 +794,7 @@ func execCopilot(excludedTools []string, mcpConfig string, extraArgs []string) e
 // execCopilotWithShellPatch runs copilot's JS bundle via node with a require
 // patch that intercepts the "!" shell escape and redirects it over SSH.
 // This bypasses the native binary so the CJS patch can monkey-patch spawn.
-func execCopilotWithShellPatch(excludedTools []string, mcpConfig string, extraArgs []string, sshClient *ssh.Client, workdir string) error {
+func execCopilotWithShellPatch(excludedTools []string, mcpConfig string, extraArgs []string, sshClient *ssh.Client, workdir, mirrorDir string) error {
 	// Write the CJS patch to a temp file
 	patchPath, err := shellpatch.WritePatch()
 	if err != nil {
@@ -817,6 +829,7 @@ func execCopilotWithShellPatch(excludedTools []string, mcpConfig string, extraAr
 		env = append(env, "COPILOT_SSH_HOST="+sshClient.SSHHost())
 	}
 	env = append(env, "CODESPACE_WORKDIR="+workdir)
+	env = append(env, "CODESPACE_MIRROR_DIR="+mirrorDir)
 
 	// Pre-fetch the auth token from keychain so node doesn't trigger a
 	// macOS keychain prompt (the keychain ACL only trusts the native binary).
@@ -869,4 +882,55 @@ func readCopilotToken() string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// detectRemoteBranch reads the current git branch from the codespace via SSH.
+func detectRemoteBranch(sshClient *ssh.Client, codespaceName, workdir string) string {
+	cmd := fmt.Sprintf("git -C %s rev-parse --abbrev-ref HEAD 2>/dev/null", shellQuote(workdir))
+	out, err := execSSH(sshClient, codespaceName, cmd)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// generateBranchSyncHook writes a postToolUse hook that keeps the local mirror's
+// git branch in sync with the codespace after remote_bash commands.
+func generateBranchSyncHook(mirrorDir, codespaceName, workdir string, sshClient *ssh.Client) {
+	hooksDir := filepath.Join(mirrorDir, ".github", "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		return
+	}
+
+	// Build SSH command: prefer multiplexed SSH for speed (~0.1s vs ~3s)
+	sshCmd := fmt.Sprintf("gh codespace ssh -c %s -- git -C %s rev-parse --abbrev-ref HEAD", shellQuote(codespaceName), shellQuote(workdir))
+	if sshClient.SSHConfigPath() != "" {
+		sshCmd = fmt.Sprintf("ssh -F %s %s git -C %s rev-parse --abbrev-ref HEAD",
+			shellQuote(sshClient.SSHConfigPath()), shellQuote(sshClient.SSHHost()), shellQuote(workdir))
+	}
+
+	// Use lenient matching: MCP tools may be namespaced (e.g., mcp__codespace__remote_bash)
+	script := fmt.Sprintf(
+		`INPUT=$(cat); echo "$INPUT" | grep -q 'remote_bash' || exit 0; branch=$(%s 2>/dev/null); [ -n "$branch" ] && git -C %s symbolic-ref HEAD "refs/heads/$branch" 2>/dev/null; exit 0`,
+		sshCmd, shellQuote(mirrorDir),
+	)
+
+	hook := map[string]any{
+		"version": 1,
+		"hooks": map[string]any{
+			"postToolUse": []any{
+				map[string]any{
+					"type":       "command",
+					"bash":       script,
+					"timeoutSec": 10,
+				},
+			},
+		},
+	}
+
+	data, err := json.MarshalIndent(hook, "", "  ")
+	if err != nil {
+		return
+	}
+	os.WriteFile(filepath.Join(hooksDir, "branch-sync.json"), data, 0o644)
 }

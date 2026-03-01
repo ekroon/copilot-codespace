@@ -49,6 +49,7 @@ const _spawn = cp.spawn;
 const sshConfig = process.env.COPILOT_SSH_CONFIG;
 const sshHost = process.env.COPILOT_SSH_HOST;
 const workdir = process.env.CODESPACE_WORKDIR || "/workspaces";
+const mirrorDir = process.env.CODESPACE_MIRROR_DIR;
 
 if (sshConfig && sshHost) {
   cp.spawn = function patchedSpawn(command, argsOrOpts, maybeOpts) {
@@ -78,7 +79,24 @@ if (sshConfig && sshHost) {
         const newOpts = Object.assign({}, opts, { shell: false });
         delete newOpts.cwd; // cwd is on the remote side now
 
-        return _spawn.call(this, "ssh", sshArgs, newOpts);
+        const child = _spawn.call(this, "ssh", sshArgs, newOpts);
+
+        // Sync local branch after the shell command completes
+        if (mirrorDir) {
+          child.on("close", () => {
+            try {
+              const { execFileSync } = require("child_process");
+              const branch = execFileSync("ssh", ["-F", sshConfig, "-o", "BatchMode=yes", sshHost,
+                "git -C " + q(workdir) + " rev-parse --abbrev-ref HEAD"], { encoding: "utf8", timeout: 5000 }).trim();
+              if (branch) {
+                execFileSync("git", ["-C", mirrorDir, "symbolic-ref", "HEAD", "refs/heads/" + branch],
+                  { timeout: 2000 });
+              }
+            } catch (_) {}
+          });
+        }
+
+        return child;
       }
     }
 
