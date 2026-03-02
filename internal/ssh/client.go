@@ -70,8 +70,14 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 		if c.sshHost != "" {
 			check := exec.CommandContext(ctx, "ssh", "-F", c.sshConfigPath, "-O", "check", c.sshHost)
 			if check.Run() == nil {
-				fmt.Fprintf(os.Stderr, "codespace-mcp: reusing existing SSH multiplexing\n")
-				return nil
+				// Smoke-test the tunnel: ssh -O check only verifies the master
+				// process is alive, not that the underlying relay still works.
+				probe := exec.CommandContext(ctx, "ssh", "-F", c.sshConfigPath, "-o", "ConnectTimeout=5", c.sshHost, "echo ok")
+				if out, err := probe.Output(); err == nil && strings.TrimSpace(string(out)) == "ok" {
+					fmt.Fprintf(os.Stderr, "codespace-mcp: reusing existing SSH multiplexing\n")
+					return nil
+				}
+				fmt.Fprintf(os.Stderr, "codespace-mcp: existing SSH master alive but tunnel broken, reconnecting\n")
 			}
 		}
 	}
@@ -356,7 +362,10 @@ func globToFindName(pattern string) string {
 // envSecretsLoader sources codespace-injected secrets (GITHUB_TOKEN, etc.)
 // that are normally loaded by the login shell profile. Non-login SSH commands
 // skip /etc/profile.d/ scripts, so we load the secrets file directly.
-const envSecretsLoader = `if [ -f /workspaces/.codespaces/shared/.env-secrets ]; then while IFS='=' read -r key value; do export "$key=$(echo "$value" | base64 -d)"; done < /workspaces/.codespaces/shared/.env-secrets; fi`
+// Guards: skip empty keys ([ -n "$key" ]) and suppress export errors (2>/dev/null)
+// so that a single malformed entry cannot break the && chain and silently drop
+// the user's command.
+const envSecretsLoader = `if [ -f /workspaces/.codespaces/shared/.env-secrets ]; then while IFS='=' read -r key value; do [ -n "$key" ] && export "$key=$(echo "$value" | base64 -d)" 2>/dev/null; done < /workspaces/.codespaces/shared/.env-secrets; true; fi`
 
 const tmuxPrefix = "copilot-"
 
@@ -563,6 +572,19 @@ func (c *Client) ForwardSocket(ctx context.Context, localPath, remotePath string
 		return fmt.Errorf("SSH multiplexing not active, cannot forward socket")
 	}
 
+	fwdSpec := localPath + ":" + remotePath
+
+	// Cancel any existing forwarding for the same spec. Without this,
+	// ssh -O forward silently succeeds when the ControlMaster already has the
+	// forwarding registered, but does NOT recreate a deleted socket file.
+	cancel := exec.CommandContext(ctx, "ssh",
+		"-F", c.sshConfigPath,
+		"-O", "cancel",
+		"-L", fwdSpec,
+		c.sshHost,
+	)
+	cancel.Run() // ignore error — forwarding may not exist yet
+
 	// Remove stale local socket if it exists
 	if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("removing stale socket %s: %w", localPath, err)
@@ -574,7 +596,7 @@ func (c *Client) ForwardSocket(ctx context.Context, localPath, remotePath string
 		"-F", c.sshConfigPath,
 		"-o", "StreamLocalBindUnlink=yes",
 		"-O", "forward",
-		"-L", localPath+":"+remotePath,
+		"-L", fwdSpec,
 		c.sshHost,
 	)
 	output, err := cmd.CombinedOutput()

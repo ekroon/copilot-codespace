@@ -72,7 +72,7 @@ if (sshConfig && sshHost) {
       if (isPipe) {
         // Build remote command: load codespace secrets, cd to workdir, then run the user's command
         const q = (s) => "'" + s.replace(/'/g, "'\\''") + "'";
-        const envLoader = "if [ -f /workspaces/.codespaces/shared/.env-secrets ]; then while IFS='=' read -r key value; do export \"$key=$(echo \"$value\" | base64 -d)\"; done < /workspaces/.codespaces/shared/.env-secrets; fi";
+        const envLoader = "if [ -f /workspaces/.codespaces/shared/.env-secrets ]; then while IFS='=' read -r key value; do [ -n \"$key\" ] && export \"$key=$(echo \"$value\" | base64 -d)\" 2>/dev/null; done < /workspaces/.codespaces/shared/.env-secrets; true; fi";
         const remoteCmd = envLoader + " && cd " + q(workdir) + " && " + command;
 
         // Replace with SSH exec — reuse the multiplexed connection
@@ -82,18 +82,20 @@ if (sshConfig && sshHost) {
 
         const child = _spawn.call(this, "ssh", sshArgs, newOpts);
 
-        // Sync local branch after the shell command completes
+        // Sync local branch after the shell command completes (non-blocking)
         if (mirrorDir) {
           child.on("close", () => {
-            try {
-              const { execFileSync } = require("child_process");
-              const branch = execFileSync("ssh", ["-F", sshConfig, "-o", "BatchMode=yes", sshHost,
-                "git -C " + q(workdir) + " rev-parse --abbrev-ref HEAD"], { encoding: "utf8", timeout: 5000 }).trim();
+            const { execFile } = require("child_process");
+            execFile("ssh", ["-F", sshConfig, "-o", "BatchMode=yes", sshHost,
+              "git -C " + q(workdir) + " rev-parse --abbrev-ref HEAD"],
+              { encoding: "utf8", timeout: 5000 }, (err, stdout) => {
+              if (err) return;
+              const branch = (stdout || "").trim();
               if (branch) {
-                execFileSync("git", ["-C", mirrorDir, "symbolic-ref", "HEAD", "refs/heads/" + branch],
-                  { timeout: 2000 });
+                execFile("git", ["-C", mirrorDir, "symbolic-ref", "HEAD", "refs/heads/" + branch],
+                  { timeout: 2000 }, () => {});
               }
-            } catch (_) {}
+            });
           });
         }
 
