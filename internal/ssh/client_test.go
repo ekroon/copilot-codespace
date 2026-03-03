@@ -93,3 +93,25 @@ func TestTmuxSessionName(t *testing.T) {
 		t.Errorf("tmuxSessionName(%q) = %q, want %q", "abc", got, "copilot-abc")
 	}
 }
+
+func TestSetGetWorkdir(t *testing.T) {
+c := NewClient("test-codespace")
+
+// Default should fall back to env or /workspaces
+got := c.GetWorkdir()
+if got == "" {
+t.Fatal("GetWorkdir() returned empty string")
+}
+
+// Set a custom workdir
+c.SetWorkdir("/workspaces/myproject/src")
+if got := c.GetWorkdir(); got != "/workspaces/myproject/src" {
+t.Errorf("GetWorkdir() = %q, want %q", got, "/workspaces/myproject/src")
+}
+
+// Override again
+c.SetWorkdir("/workspaces/other")
+if got := c.GetWorkdir(); got != "/workspaces/other" {
+t.Errorf("GetWorkdir() = %q, want %q", got, "/workspaces/other")
+}
+}

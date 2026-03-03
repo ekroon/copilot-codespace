@@ -46,3 +46,23 @@ func TestWritePatch_CleanupWorks(t *testing.T) {
 		t.Errorf("expected directory %q to be removed, but it still exists", dir)
 	}
 }
+
+func TestPatchJS_DynamicWorkdirRead(t *testing.T) {
+	// Verify workdir is NOT captured at module scope (top level).
+	// It should only appear inside the patchedSpawn function body.
+	lines := strings.Split(patchJS, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == `const workdir = process.env.CODESPACE_WORKDIR || "/workspaces";` {
+			// If this line is near sshConfig/sshHost, it's at top level (bad)
+			start := i - 5
+			if start < 0 {
+				start = 0
+			}
+			context := strings.Join(lines[start:i], "\n")
+			if strings.Contains(context, "const sshHost") || strings.Contains(context, "const sshConfig") {
+				t.Error("workdir should NOT be captured at module scope; it should be read inside patchedSpawn")
+			}
+		}
+	}
+}

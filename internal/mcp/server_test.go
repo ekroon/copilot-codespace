@@ -235,6 +235,7 @@ type mockExecutor struct {
 	stopSessionErr     error
 	listSessionsResult string
 	listSessionsErr    error
+	workdir            string
 }
 
 func (m *mockExecutor) ViewFile(_ context.Context, _ string, _ []int) (string, error) {
@@ -279,6 +280,17 @@ func (m *mockExecutor) StopSession(_ context.Context, _ string) error {
 
 func (m *mockExecutor) ListSessions(_ context.Context) (string, error) {
 	return m.listSessionsResult, m.listSessionsErr
+}
+
+func (m *mockExecutor) SetWorkdir(dir string) {
+	m.workdir = dir
+}
+
+func (m *mockExecutor) GetWorkdir() string {
+	if m.workdir == "" {
+		return "/workspaces"
+	}
+	return m.workdir
 }
 
 // helper to extract text from a CallToolResult
@@ -669,4 +681,92 @@ func TestListBashHandler(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCdHandler(t *testing.T) {
+tests := []struct {
+name     string
+args     map[string]any
+mock     *mockExecutor
+wantErr  bool
+wantText string
+wantDir  string
+}{
+{
+name:     "missing path",
+args:     map[string]any{},
+mock:     &mockExecutor{},
+wantErr:  true,
+wantText: "missing required parameter",
+},
+{
+name:     "directory exists",
+args:     map[string]any{"path": "/workspaces/myproject/src"},
+mock:     &mockExecutor{runBashStdout: "/workspaces/myproject/src\n", runBashExit: 0},
+wantText: "Changed working directory",
+wantDir:  "/workspaces/myproject/src",
+},
+{
+name:     "directory does not exist",
+args:     map[string]any{"path": "/nonexistent"},
+mock:     &mockExecutor{runBashExit: 1},
+wantErr:  true,
+wantText: "directory does not exist",
+},
+{
+name:     "executor error",
+args:     map[string]any{"path": "/workspaces"},
+mock:     &mockExecutor{runBashErr: fmt.Errorf("connection failed")},
+wantErr:  true,
+wantText: "failed to change directory",
+},
+}
+for _, tt := range tests {
+t.Run(tt.name, func(t *testing.T) {
+handler := cdHandler(tt.mock)
+res, err := handler(context.Background(), makeReq(tt.args))
+if err != nil {
+t.Fatalf("unexpected Go error: %v", err)
+}
+if tt.wantErr && !res.IsError {
+t.Fatal("expected tool error, got success")
+}
+if !tt.wantErr && res.IsError {
+t.Fatalf("expected success, got tool error: %s", resultText(res))
+}
+if !strings.Contains(resultText(res), tt.wantText) {
+t.Errorf("result text %q does not contain %q", resultText(res), tt.wantText)
+}
+if tt.wantDir != "" && tt.mock.workdir != tt.wantDir {
+t.Errorf("expected workdir %q, got %q", tt.wantDir, tt.mock.workdir)
+}
+})
+}
+}
+
+func TestCwdHandler(t *testing.T) {
+mock := &mockExecutor{workdir: "/workspaces/myproject"}
+handler := cwdHandler(mock)
+res, err := handler(context.Background(), makeReq(map[string]any{}))
+if err != nil {
+t.Fatalf("unexpected Go error: %v", err)
+}
+if res.IsError {
+t.Fatalf("expected success, got tool error: %s", resultText(res))
+}
+if !strings.Contains(resultText(res), "/workspaces/myproject") {
+t.Errorf("expected workdir in result, got %q", resultText(res))
+}
+}
+
+func TestCwdHandlerDefault(t *testing.T) {
+mock := &mockExecutor{}
+handler := cwdHandler(mock)
+res, err := handler(context.Background(), makeReq(map[string]any{}))
+if err != nil {
+t.Fatalf("unexpected Go error: %v", err)
+}
+if !strings.Contains(resultText(res), "/workspaces") {
+t.Errorf("expected default workdir, got %q", resultText(res))
+}
 }

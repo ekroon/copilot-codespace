@@ -19,6 +19,7 @@ type Client struct {
 	sshConfigPath string // path to generated SSH config with ControlMaster
 	sshHost       string // SSH host alias (e.g., "cs.develop-xxx")
 	controlSocket string // path to control socket
+	workdir       string // current working directory on the codespace
 }
 
 // Executor defines the operations that MCP handlers use to interact with a codespace.
@@ -34,11 +35,34 @@ type Executor interface {
 	ReadSession(ctx context.Context, sessionID string) (string, error)
 	StopSession(ctx context.Context, sessionID string) error
 	ListSessions(ctx context.Context) (string, error)
+	SetWorkdir(dir string)
+	GetWorkdir() string
 }
 
 // NewClient creates a new SSH client for the given codespace.
 func NewClient(codespaceName string) *Client {
 	return &Client{codespaceName: codespaceName}
+}
+
+// SetWorkdir sets the working directory used by RunBash and Glob.
+func (c *Client) SetWorkdir(dir string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.workdir = dir
+}
+
+// GetWorkdir returns the current working directory. Falls back to
+// CODESPACE_WORKDIR env var, then "/workspaces".
+func (c *Client) GetWorkdir() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.workdir != "" {
+		return c.workdir
+	}
+	if wd := os.Getenv("CODESPACE_WORKDIR"); wd != "" {
+		return wd
+	}
+	return "/workspaces"
 }
 
 // SetupMultiplexing generates an SSH config with ControlMaster and establishes
@@ -281,10 +305,7 @@ func (c *Client) CreateFile(ctx context.Context, path, content string) error {
 
 // RunBash executes a bash command on the codespace.
 func (c *Client) RunBash(ctx context.Context, command string) (stdout string, stderr string, exitCode int, err error) {
-	workdir := os.Getenv("CODESPACE_WORKDIR")
-	if workdir == "" {
-		workdir = "/workspaces"
-	}
+	workdir := c.GetWorkdir()
 
 	wrapped := fmt.Sprintf("cd %s && %s", shellQuote(workdir), command)
 	return c.Exec(ctx, wrapped)
@@ -329,10 +350,7 @@ func (c *Client) Grep(ctx context.Context, pattern, path, globPattern string) (s
 func (c *Client) Glob(ctx context.Context, pattern, path string) (string, error) {
 	searchPath := path
 	if searchPath == "" {
-		searchPath = os.Getenv("CODESPACE_WORKDIR")
-		if searchPath == "" {
-			searchPath = "/workspaces"
-		}
+		searchPath = c.GetWorkdir()
 	}
 
 	// Use fd if available (supports glob natively), fallback to find with -name

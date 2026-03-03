@@ -28,6 +28,8 @@ func NewServer(sshClient ssh.Executor, codespaceName string) *server.MCPServer {
 	s.AddTool(stopBashTool(), stopBashHandler(sshClient))
 	s.AddTool(listBashTool(), listBashHandler(sshClient))
 	s.AddTool(openShellTool(), openShellHandler(codespaceName))
+	s.AddTool(cdTool(), cdHandler(sshClient))
+	s.AddTool(cwdTool(), cwdHandler(sshClient))
 
 	return s
 }
@@ -561,6 +563,70 @@ func toolError(text string) *mcpsdk.CallToolResult {
 				Text: text,
 			},
 		},
+	}
+}
+
+// --- remote_cd ---
+
+func cdTool() mcpsdk.Tool {
+	return mcpsdk.Tool{
+		Name:        "remote_cd",
+		Description: "Change the working directory on the remote codespace. Affects all subsequent remote_bash, remote_grep, and remote_glob commands. The directory must exist on the codespace.",
+		InputSchema: mcpsdk.ToolInputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "The directory path to change to on the codespace",
+				},
+			},
+			Required: []string{"path"},
+		},
+	}
+}
+
+func cdHandler(c ssh.Executor) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		path, err := requiredString(req, "path")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+
+		// Validate the directory exists on the codespace
+		quoted := "'" + strings.ReplaceAll(path, "'", "'\"'\"'") + "'"
+		stdout, _, exitCode, execErr := c.RunBash(ctx, fmt.Sprintf("cd %s && pwd", quoted))
+		if execErr != nil {
+			return toolError(fmt.Sprintf("failed to change directory: %v", execErr)), nil
+		}
+		if exitCode != 0 {
+			return toolError(fmt.Sprintf("directory does not exist: %s", path)), nil
+		}
+
+		resolved := strings.TrimSpace(stdout)
+		if resolved == "" {
+			resolved = path
+		}
+		c.SetWorkdir(resolved)
+		return toolSuccess(fmt.Sprintf("Changed working directory to %s", resolved)), nil
+	}
+}
+
+// --- remote_cwd ---
+
+func cwdTool() mcpsdk.Tool {
+	return mcpsdk.Tool{
+		Name:        "remote_cwd",
+		Description: "Get the current working directory on the remote codespace.",
+		InputSchema: mcpsdk.ToolInputSchema{
+			Type:       "object",
+			Properties: map[string]any{},
+		},
+	}
+}
+
+func cwdHandler(c ssh.Executor) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		return toolSuccess(c.GetWorkdir()), nil
 	}
 }
 

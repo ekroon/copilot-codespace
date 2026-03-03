@@ -179,6 +179,10 @@ func runLauncher(args []string) error {
 		return fmt.Errorf("fetching instructions: %w", err)
 	}
 
+	// Prepend codespace context to copilot-instructions.md so the agent knows
+	// how to route between local tools (session state) and remote tools (codespace)
+	writeCodespaceInstructionsPreamble(instructionsDir, workdir)
+
 	// Ensure the directory is trusted by copilot so it doesn't prompt each time
 	if err := ensureTrustedFolder(instructionsDir); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not auto-trust directory: %v\n", err)
@@ -205,11 +209,12 @@ func runLauncher(args []string) error {
 	// plus any MCP servers from the codespace's .copilot/mcp-config.json
 	mcpConfig := buildMCPConfig(self, selected.Name, workdir, remoteMCPServers, remoteBinary)
 
-	// Excluded tools — only local file/shell tools that have remote equivalents
-	// Keep task (sub-agents), web_fetch, ask_user, sql, etc.
+	// Excluded tools — local shell/search tools that have remote equivalents.
+	// Keep edit, create, view enabled so the agent can manage local session
+	// state files (plan.md, etc.) while using remote_* for codespace files.
 	excludedTools := []string{
-		"edit", "create", "bash", "write_bash", "read_bash",
-		"stop_bash", "list_bash", "view", "grep", "glob",
+		"bash", "write_bash", "read_bash",
+		"stop_bash", "list_bash", "grep", "glob",
 	}
 
 	// Forward IDE connections from codespace so copilot can auto-connect
@@ -588,6 +593,38 @@ func parseMCPConfigJSON(content []byte) map[string]any {
 		return nil
 	}
 	return rewritten
+}
+
+// writeCodespaceInstructionsPreamble prepends a codespace-context section to the
+// copilot-instructions.md in the mirror dir. If the file doesn't exist, it creates it.
+// This tells the agent how to route between local and remote tools.
+func writeCodespaceInstructionsPreamble(mirrorDir, workdir string) {
+	preamble := fmt.Sprintf(`# Codespace Remote Development
+
+You are working on a remote GitHub Codespace. Source code lives on the codespace at %s, NOT locally.
+
+## Tool routing
+
+- **Source code** (viewing, editing, creating, searching files in the project): use remote_* tools (remote_view, remote_edit, remote_create, remote_bash, remote_grep, remote_glob)
+- **Local session files** (plan.md, session state, notes under ~/.copilot/): use the built-in local tools (view, edit, create)
+- **Shell commands**: use remote_bash (runs on the codespace), NOT the local bash
+
+`, workdir)
+
+	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
+		return
+	}
+
+	existing, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		// File doesn't exist; create with just the preamble
+		os.WriteFile(instructionsPath, []byte(preamble), 0o644)
+		return
+	}
+	// Prepend preamble to existing content
+	combined := preamble + string(existing)
+	os.WriteFile(instructionsPath, []byte(combined), 0o644)
 }
 
 // cleanMirrorDir removes all contents of the mirror directory except .git/,

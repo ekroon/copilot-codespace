@@ -48,7 +48,6 @@ const _spawn = cp.spawn;
 
 const sshConfig = process.env.COPILOT_SSH_CONFIG;
 const sshHost = process.env.COPILOT_SSH_HOST;
-const workdir = process.env.CODESPACE_WORKDIR || "/workspaces";
 const mirrorDir = process.env.CODESPACE_MIRROR_DIR;
 
 if (sshConfig && sshHost) {
@@ -70,6 +69,8 @@ if (sshConfig && sshHost) {
       const isPipe = stdio === "pipe" ||
         (Array.isArray(stdio) && stdio[0] === "pipe" && stdio[1] === "pipe");
       if (isPipe) {
+        // Read workdir dynamically so /cd changes take effect
+        const workdir = process.env.CODESPACE_WORKDIR || "/workspaces";
         // Build remote command: load codespace secrets, cd to workdir, then run the user's command
         const q = (s) => "'" + s.replace(/'/g, "'\\''") + "'";
         const envLoader = "if [ -f /workspaces/.codespaces/shared/.env-secrets ]; then while IFS='=' read -r key value; do [ -n \"$key\" ] && export \"$key=$(echo \"$value\" | base64 -d)\" 2>/dev/null; done < /workspaces/.codespaces/shared/.env-secrets; true; fi";
