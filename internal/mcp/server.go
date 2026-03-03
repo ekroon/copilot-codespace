@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekroon/copilot-codespace/internal/ssh"
+	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )

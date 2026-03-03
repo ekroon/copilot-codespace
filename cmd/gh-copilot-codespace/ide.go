@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ekroon/copilot-codespace/internal/ssh"
+	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
 
 // ideLockFile represents a lock file written by a VSCode extension at ~/.copilot/ide/.

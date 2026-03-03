@@ -1,4 +1,4 @@
-module github.com/ekroon/copilot-codespace
+module github.com/ekroon/gh-copilot-codespace
 
 go 1.25.0
 

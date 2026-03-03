@@ -9,10 +9,10 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/ekroon/copilot-codespace/internal/ssh"
+	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
 
-const remoteBinaryDir = "/tmp/copilot-codespace-bin"
+const remoteBinaryDir = "/tmp/gh-copilot-codespace-bin"
 
 // deployBinary copies this binary to the codespace for use as a remote exec agent.
 // In dev mode (go run / local build), it cross-compiles for linux.
@@ -25,7 +25,7 @@ func deployBinary(sshClient *ssh.Client, codespaceName string) (string, error) {
 		return "", fmt.Errorf("detecting codespace arch: %w", err)
 	}
 
-	remotePath := remoteBinaryDir + "/copilot-codespace"
+	remotePath := remoteBinaryDir + "/gh-copilot-codespace"
 
 	// Check if binary already exists on codespace and is current
 	localBin, _ := os.Executable()
@@ -126,14 +126,14 @@ func crossCompile(arch string) (string, func(), error) {
 		return "", nil, fmt.Errorf("finding module root: %w", err)
 	}
 
-	tmpDir, err := os.MkdirTemp("", "copilot-codespace-cross-*")
+	tmpDir, err := os.MkdirTemp("", "gh-copilot-codespace-cross-*")
 	if err != nil {
 		return "", nil, err
 	}
 	cleanup := func() { os.RemoveAll(tmpDir) }
 
-	outPath := filepath.Join(tmpDir, "copilot-codespace")
-	cmd := exec.Command(goPath, "build", "-ldflags=-s -w", "-o", outPath, "./cmd/copilot-codespace")
+	outPath := filepath.Join(tmpDir, "gh-copilot-codespace")
+	cmd := exec.Command(goPath, "build", "-ldflags=-s -w", "-o", outPath, "./cmd/gh-copilot-codespace")
 	cmd.Dir = modRoot
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+arch, "CGO_ENABLED=0")
 	cmd.Stderr = os.Stderr
@@ -189,17 +189,17 @@ func findModuleRoot() (string, error) {
 
 // downloadReleaseBinary downloads the linux binary from the latest GitHub release.
 func downloadReleaseBinary(arch string) (string, func(), error) {
-	tmpDir, err := os.MkdirTemp("", "copilot-codespace-download-*")
+	tmpDir, err := os.MkdirTemp("", "gh-copilot-codespace-download-*")
 	if err != nil {
 		return "", nil, err
 	}
 	cleanup := func() { os.RemoveAll(tmpDir) }
 
-	pattern := fmt.Sprintf("copilot-codespace-linux-%s", arch)
-	outPath := filepath.Join(tmpDir, "copilot-codespace")
+	pattern := fmt.Sprintf("gh-copilot-codespace-linux-%s", arch)
+	outPath := filepath.Join(tmpDir, "gh-copilot-codespace")
 
 	cmd := exec.Command("gh", "release", "download",
-		"--repo", "ekroon/copilot-codespace",
+		"--repo", "ekroon/gh-copilot-codespace",
 		"--pattern", pattern,
 		"--output", outPath)
 	cmd.Stderr = os.Stderr

@@ -10,7 +10,7 @@ import (
 // runExec runs a command with optional workdir and env setup.
 // Used on the codespace as a structured alternative to bash -c with shell escaping.
 //
-// Usage: copilot-codespace exec [--workdir DIR] [--env K=V]... -- COMMAND [ARGS...]
+// Usage: gh-copilot-codespace exec [--workdir DIR] [--env K=V]... -- COMMAND [ARGS...]
 func runExec(args []string) error {
 	var workdir string
 	var envVars []string

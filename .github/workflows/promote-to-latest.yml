@@ -53,7 +53,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release download "${{ steps.resolve.outputs.tag }}" --pattern 'copilot-codespace-*' --dir ./artifacts
+          gh release download "${{ steps.resolve.outputs.tag }}" --pattern 'gh-copilot-codespace-*' --dir ./artifacts
           ls -la ./artifacts/
 
       - name: Promote to latest
@@ -72,6 +72,6 @@ jobs:
           ## Install with mise
 
           \`\`\`sh
-          mise use -g github:ekroon/copilot-codespace
+          mise use -g github:ekroon/gh-copilot-codespace
           \`\`\`" \
-            ./artifacts/copilot-codespace-*
+            ./artifacts/gh-copilot-codespace-*

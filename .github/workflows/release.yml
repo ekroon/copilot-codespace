@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     branches: [main]
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -18,7 +20,21 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
+  # Tag push: create gh-extension-compatible release via precompile action
+  extension-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cli/gh-extension-precompile@v2
+        with:
+          go_version_file: go.mod
+          go_build_options: "./cmd/gh-copilot-codespace"
+
+  # Main branch push: create dev pre-release for mise
   release:
+    if: github.ref == 'refs/heads/main'
     needs: [check]
     runs-on: ubuntu-latest
     strategy:
@@ -44,14 +60,15 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          go build -ldflags="-s -w" -o copilot-codespace-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/copilot-codespace
+          go build -ldflags="-s -w" -o gh-copilot-codespace-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/gh-copilot-codespace
 
       - uses: actions/upload-artifact@v4
         with:
-          name: copilot-codespace-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: copilot-codespace-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: gh-copilot-codespace-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: gh-copilot-codespace-${{ matrix.goos }}-${{ matrix.goarch }}
 
   publish:
+    if: github.ref == 'refs/heads/main'
     needs: release
     runs-on: ubuntu-latest
     steps:
@@ -72,10 +89,14 @@ jobs:
             --title "dev-${SHORT_SHA}" \
             --notes "Pre-release build from commit ${GITHUB_SHA}
 
-          ## Install with mise
+          ## Install
 
           \`\`\`sh
-          mise use -g github:ekroon/copilot-codespace
+          # As gh extension
+          gh extension install ekroon/gh-copilot-codespace
+
+          # With mise
+          mise use -g github:ekroon/gh-copilot-codespace
           \`\`\`" \
             --prerelease \
-            copilot-codespace-*
+            gh-copilot-codespace-*

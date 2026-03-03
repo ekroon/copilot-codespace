@@ -1,7 +1,7 @@
 ---
 name: release
 description: >-
-  Release the copilot-codespace project: commit, push, wait for CI, signoff, and promote to latest.
+  Release the gh-copilot-codespace project: commit, push, wait for CI, signoff, and promote to latest.
   Use this skill when the user asks to "release", "ship it", "push and release", "promote to latest",
   "cut a release", "deploy", or any variation of committing + pushing + waiting for CI + promoting.
   Also use when the user says "commit and release" or "push to main and release". This skill handles
@@ -10,7 +10,7 @@ description: >-
 
 # Release Skill
 
-Automates the full release pipeline for copilot-codespace: commit → push → CI → signoff → promote to latest.
+Automates the full release pipeline for gh-copilot-codespace: commit → push → CI → signoff → promote to latest.
 
 ## When to use
 
@@ -38,7 +38,7 @@ The release script handles everything after commit. Run it from the repo root:
 
 ```bash
 chmod +x .claude/skills/release/scripts/*.sh
-.claude/skills/release/scripts/release.sh ekroon copilot-codespace main
+.claude/skills/release/scripts/release.sh ekroon gh-copilot-codespace main
 ```
 
 This will:
@@ -59,10 +59,10 @@ If you only need part of the flow:
 ```bash
 # Find the workflow run for a commit
 SCRIPTS=".claude/skills/release/scripts"
-RUN_ID=$("$SCRIPTS/find-workflow-run.sh" ekroon copilot-codespace <sha> release.yml)
+RUN_ID=$("$SCRIPTS/find-workflow-run.sh" ekroon gh-copilot-codespace <sha> release.yml)
 
 # Wait for it to complete (10s poll, 600s timeout)
-"$SCRIPTS/wait-for-workflow.sh" ekroon copilot-codespace "$RUN_ID" 10 600
+"$SCRIPTS/wait-for-workflow.sh" ekroon gh-copilot-codespace "$RUN_ID" 10 600
 
 # Just signoff
 gh signoff integration

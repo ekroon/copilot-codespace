@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ekroon/copilot-codespace/internal/ssh"
+	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 )
 
 // These tests require a running codespace with test fixtures.
-// Run: TEST_CODESPACE=<name> go test -tags integration -v ./cmd/copilot-codespace/
+// Run: TEST_CODESPACE=<name> go test -tags integration -v ./cmd/gh-copilot-codespace/
 
 func testCodespace(t *testing.T) string {
 	t.Helper()

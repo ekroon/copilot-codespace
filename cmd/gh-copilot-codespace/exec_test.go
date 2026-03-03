@@ -16,7 +16,7 @@ func TestRewriteMCPServerForSSH_WithRemoteBinary(t *testing.T) {
 		},
 	}
 
-	result := rewriteMCPServerForSSH(server, "my-cs", "/workspaces/repo", "/tmp/copilot-codespace-bin/copilot-codespace")
+	result := rewriteMCPServerForSSH(server, "my-cs", "/workspaces/repo", "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace")
 
 	if result == nil {
 		t.Fatal("rewriteMCPServerForSSH returned nil")
@@ -35,7 +35,7 @@ func TestRewriteMCPServerForSSH_WithRemoteBinary(t *testing.T) {
 	// Should contain the remote binary path
 	found := false
 	for _, a := range args {
-		if a == "/tmp/copilot-codespace-bin/copilot-codespace" {
+		if a == "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace" {
 			found = true
 			break
 		}
@@ -149,7 +149,7 @@ func TestRewriteHooksForSSH_WithRemoteBinary(t *testing.T) {
 		}
 	}`
 
-	result := rewriteHooksForSSH([]byte(hooksJSON), "my-cs", "/workspaces/repo", "/tmp/copilot-codespace-bin/copilot-codespace")
+	result := rewriteHooksForSSH([]byte(hooksJSON), "my-cs", "/workspaces/repo", "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace")
 	if result == nil {
 		t.Fatal("rewriteHooksForSSH returned nil")
 	}
@@ -165,7 +165,7 @@ func TestRewriteHooksForSSH_WithRemoteBinary(t *testing.T) {
 	bash := hook["bash"].(string)
 
 	// Should contain the remote binary path and exec subcommand
-	if !contains(bash, "/tmp/copilot-codespace-bin/copilot-codespace") {
+	if !contains(bash, "/tmp/gh-copilot-codespace-bin/gh-copilot-codespace") {
 		t.Errorf("should contain remote binary path, got %q", bash)
 	}
 	if !contains(bash, "exec") {

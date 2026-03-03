@@ -16,9 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ekroon/copilot-codespace/internal/mcp"
-	"github.com/ekroon/copilot-codespace/internal/shellpatch"
-	"github.com/ekroon/copilot-codespace/internal/ssh"
+	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
+	"github.com/ekroon/gh-copilot-codespace/internal/shellpatch"
+	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -871,37 +871,51 @@ func shellQuote(s string) string {
 }
 
 func execCopilot(excludedTools []string, mcpConfig string, extraArgs []string) error {
-	copilotPath, err := exec.LookPath("copilot")
-	if err != nil {
-		return fmt.Errorf("copilot not found in PATH: %w", err)
-	}
-
-	args := []string{"copilot",
+	copilotArgs := []string{
 		"--excluded-tools",
 	}
-	args = append(args, excludedTools...)
-	args = append(args, "--additional-mcp-config", mcpConfig)
-	args = append(args, extraArgs...)
+	copilotArgs = append(copilotArgs, excludedTools...)
+	copilotArgs = append(copilotArgs, "--additional-mcp-config", mcpConfig)
+	copilotArgs = append(copilotArgs, extraArgs...)
 
-	return syscall.Exec(copilotPath, args, os.Environ())
+	// Try standalone copilot binary first
+	if copilotPath, err := exec.LookPath("copilot"); err == nil {
+		args := append([]string{"copilot"}, copilotArgs...)
+		return syscall.Exec(copilotPath, args, os.Environ())
+	}
+
+	// Fall back to gh copilot (gh manages the copilot binary installation)
+	ghPath, err := exec.LookPath("gh")
+	if err != nil {
+		return fmt.Errorf("neither 'copilot' nor 'gh' found in PATH; install copilot CLI or gh CLI")
+	}
+
+	// Use "--" so gh doesn't interpret copilot's flags
+	args := append([]string{"gh", "copilot", "--"}, copilotArgs...)
+	return syscall.Exec(ghPath, args, os.Environ())
 }
 
 // execCopilotWithShellPatch runs copilot's JS bundle via node with a require
 // patch that intercepts the "!" shell escape and redirects it over SSH.
 // This bypasses the native binary so the CJS patch can monkey-patch spawn.
+// If the copilot binary is not in PATH (e.g. using gh copilot), falls back
+// to execCopilot with a warning since the shell patch requires index.js.
 func execCopilotWithShellPatch(excludedTools []string, mcpConfig string, extraArgs []string, sshClient *ssh.Client, workdir, mirrorDir string) error {
+	// Find copilot's index.js (the JS bundle) — requires copilot in PATH
+	indexJS, err := findCopilotIndexJS()
+	if err != nil {
+		// Shell patch needs the copilot JS bundle which isn't available via gh copilot.
+		// Fall back to execCopilot (which handles gh copilot fallback).
+		fmt.Fprintf(os.Stderr, "Warning: shell patch unavailable (%v); '!' commands will run locally\n", err)
+		return execCopilot(excludedTools, mcpConfig, extraArgs)
+	}
+
 	// Write the CJS patch to a temp file
 	patchPath, err := shellpatch.WritePatch()
 	if err != nil {
 		return fmt.Errorf("writing shell patch: %w", err)
 	}
 	defer os.RemoveAll(filepath.Dir(patchPath))
-
-	// Find copilot's index.js (the JS bundle)
-	indexJS, err := findCopilotIndexJS()
-	if err != nil {
-		return fmt.Errorf("finding copilot index.js: %w", err)
-	}
 
 	// Find node binary
 	nodePath, err := exec.LookPath("node")

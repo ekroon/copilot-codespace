@@ -1,46 +1,52 @@
-# copilot-codespace
+# gh-copilot-codespace
 
 Launch Copilot CLI with all file/bash operations executing on a remote GitHub Codespace via SSH.
 
 ## How it works
 
-A single Go binary (`copilot-codespace`) serves three roles:
+A single Go binary (`gh-copilot-codespace`) serves three roles:
 
 1. **Launcher mode** (default) — Lists your codespaces, lets you pick one, starts it if needed, deploys the exec agent, fetches instruction files and project-level components, then launches `copilot` with:
    - `--excluded-tools` — disables 11 built-in local tools
    - `--additional-mcp-config` — adds itself as the MCP server (plus any remote MCP configs)
 
-2. **MCP server mode** (`copilot-codespace mcp`) — Spawned by copilot, provides 10 remote tools over SSH:
+2. **MCP server mode** (`gh-copilot-codespace mcp`) — Spawned by copilot, provides 10 remote tools over SSH:
    - `remote_view`, `remote_edit`, `remote_create` — file operations
    - `remote_bash` (sync + async), `remote_grep`, `remote_glob` — commands & search
    - `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash` — async session management (tmux-based)
 
-3. **Exec agent** (`copilot-codespace exec`) — Deployed to the codespace at startup. Provides structured command execution with workdir/env setup, replacing fragile shell escaping in SSH forwarding.
+3. **Exec agent** (`gh-copilot-codespace exec`) — Deployed to the codespace at startup. Provides structured command execution with workdir/env setup, replacing fragile shell escaping in SSH forwarding.
 
 ## Prerequisites
 
 - `gh` CLI authenticated with `codespace` scope
 - At least one GitHub Codespace
-- [Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) installed
+- [Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) installed (or available via `gh copilot`)
 
 ## Installation
 
 ```bash
-# With mise (recommended)
-mise use -g github:ekroon/copilot-codespace
+# As a gh extension (recommended)
+gh extension install ekroon/gh-copilot-codespace
+
+# With mise
+mise use -g github:ekroon/gh-copilot-codespace
 
 # Or build from source
-go build -o copilot-codespace ./cmd/copilot-codespace
+go build -o gh-copilot-codespace ./cmd/gh-copilot-codespace
 ```
 
 ## Quick start
 
 ```bash
-# Run (interactive codespace picker → copilot with remote tools)
-copilot-codespace
+# Via gh extension
+gh copilot-codespace
+
+# Or directly (if installed via mise or built from source)
+gh-copilot-codespace
 
 # Pass extra copilot flags
-copilot-codespace --model claude-sonnet-4.5
+gh copilot-codespace --model claude-sonnet-4.5
 ```
 
 ## What gets fetched from the codespace
@@ -71,7 +77,7 @@ The launcher fetches all project-level Copilot CLI components in a single SSH ca
 ## Local `!` shell escape
 
 ```bash
-copilot-codespace --local-shell
+gh-copilot-codespace --local-shell
 ```
 
 When this flag is set, `!` commands execute locally instead of on the codespace. This uses the native `copilot` binary directly (faster startup, no Node.js dependency).
@@ -110,7 +116,9 @@ gh signoff integration
 
 Every push to `main` triggers CI (vet, test, cross-platform build). If CI passes, a pre-release (`dev-{sha}`) is created automatically.
 
-To promote to `latest`, run the "Promote to Latest" workflow from the GitHub Actions tab (or `gh workflow run promote-to-latest.yml`). It checks signoff on the latest main commit and promotes the existing pre-release to `latest`.
+To create a stable release for gh extension users, push a semver tag (e.g., `git tag v0.1.0 && git push origin v0.1.0`). This triggers a release via `cli/gh-extension-precompile` which builds binaries compatible with `gh extension install/upgrade`.
+
+To promote a dev pre-release to `latest` (for mise users), run the "Promote to Latest" workflow from the GitHub Actions tab (or `gh workflow run promote-to-latest.yml`). It checks signoff on the latest main commit and promotes the existing pre-release to `latest`.
 
 ## Environment variables
 

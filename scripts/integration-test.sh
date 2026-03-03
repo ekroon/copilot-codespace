@@ -9,12 +9,12 @@ pass() { echo "  ✓ $1"; PASS=$((PASS + 1)); }
 fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
 skip() { echo "  ⊘ $1 (skipped)"; SKIP=$((SKIP + 1)); }
 
-echo "=== copilot-codespace integration tests ==="
+echo "=== gh-copilot-codespace integration tests ==="
 echo ""
 
 # 1. Build fresh binary
 echo "Building..."
-go build -o ./copilot-codespace ./cmd/copilot-codespace
+go build -o ./gh-copilot-codespace ./cmd/gh-copilot-codespace
 pass "Binary compiles"
 
 # 2. MCP server starts and responds to JSON-RPC initialize
@@ -22,7 +22,7 @@ echo ""
 echo "Test: MCP server responds to initialize..."
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}'
 MCP_OUT=$(mktemp)
-printf '%s\n' "$INIT_REQ" | CODESPACE_NAME=test-dummy ./copilot-codespace mcp > "$MCP_OUT" 2>/dev/null &
+printf '%s\n' "$INIT_REQ" | CODESPACE_NAME=test-dummy ./gh-copilot-codespace mcp > "$MCP_OUT" 2>/dev/null &
 MCP_PID=$!
 sleep 3
 kill "$MCP_PID" 2>/dev/null || true
@@ -63,7 +63,7 @@ echo ""
 echo "=== Results: $PASS passed, $FAIL failed, $SKIP skipped ==="
 
 # Clean up
-rm -f ./copilot-codespace
+rm -f ./gh-copilot-codespace
 
 if [[ $FAIL -gt 0 ]]; then
   echo ""
