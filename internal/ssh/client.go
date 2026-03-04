@@ -190,9 +190,6 @@ func (c *Client) SSHConfigPath() string {
 
 // Exec runs a command on the codespace and returns stdout, stderr, and exit code.
 func (c *Client) Exec(ctx context.Context, command string) (stdout string, stderr string, exitCode int, err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	// Ensure codespace-injected secrets are available for git auth etc.
 	wrapped := envSecretsLoader + " && " + command
 

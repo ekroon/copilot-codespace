@@ -33,7 +33,7 @@ type LifecycleConfig struct {
 func createCodespaceTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "create_codespace",
-		Description: "Create a new GitHub Codespace, wait for it to be ready, and connect to it. Use get_codespace_options first to see available machine types and devcontainer configs for the repository.",
+		Description: "Create a new GitHub Codespace, wait for it to be ready, and connect to it. This operation may take 1-3 minutes. Use get_codespace_options first to see available machine types and devcontainer configs for the repository.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -250,7 +250,7 @@ func detectCSWorkdir(ctx context.Context, client *ssh.Client, repo string) strin
 func connectCodespaceTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "connect_codespace",
-		Description: "Connect to an existing GitHub Codespace that is not yet in the current session.",
+		Description: "Connect to an existing GitHub Codespace that is not yet in the current session. May take 30-60 seconds for SSH setup and exec agent deployment.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{

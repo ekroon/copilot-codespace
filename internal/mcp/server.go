@@ -239,7 +239,7 @@ func createHandler(reg *registry.Registry) server.ToolHandlerFunc {
 func bashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_bash",
-		Description: "Execute a bash command on the remote codespace. Use mode 'async' for long-running or interactive commands (returns a shellId for use with remote_write_bash/remote_read_bash). Replaces the local 'bash' tool.",
+		Description: "Execute a bash command on the remote codespace. Use mode 'async' for commands that may take more than 30 seconds (builds, tests, benchmarks) to avoid MCP timeout. Async mode returns a shellId for use with remote_write_bash/remote_read_bash. Replaces the local 'bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -295,7 +295,11 @@ func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 
 		stdout, stderr, exitCode, err := c.RunBash(ctx, command)
 		if err != nil {
-			return toolError(err.Error()), nil
+			errMsg := err.Error()
+			if ctx.Err() != nil {
+				errMsg += "\n\nHint: This command may have timed out. Use mode='async' for long-running commands (builds, tests, benchmarks)."
+			}
+			return toolError(errMsg), nil
 		}
 
 		var result strings.Builder
