@@ -156,7 +156,7 @@ func containsHelper(s, substr string) bool {
 func TestCleanMirrorDir(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create some files and directories including .git
+	// Create some files and directories including .git, files/, workspace.json
 	os.MkdirAll(filepath.Join(dir, ".git", "objects"), 0o755)
 	os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("ref"), 0o644)
 	os.MkdirAll(filepath.Join(dir, ".github"), 0o755)
@@ -164,12 +164,17 @@ func TestCleanMirrorDir(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("agents"), 0o644)
 	os.MkdirAll(filepath.Join(dir, "docs"), 0o755)
 	os.WriteFile(filepath.Join(dir, "docs", "AGENTS.md"), []byte("docs agents"), 0o644)
+	os.MkdirAll(filepath.Join(dir, "files"), 0o755)
+	os.WriteFile(filepath.Join(dir, "files", "plan.md"), []byte("my plan"), 0o644)
+	os.WriteFile(filepath.Join(dir, "workspace.json"), []byte("{}"), 0o644)
 
 	cleanMirrorDir(dir)
 
-	// .git should survive
-	if _, err := os.Stat(filepath.Join(dir, ".git", "HEAD")); err != nil {
-		t.Error(".git/HEAD should survive cleanup")
+	// .git, files/, workspace.json should survive
+	for _, name := range []string{".git/HEAD", "files/plan.md", "workspace.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s should survive cleanup", name)
+		}
 	}
 
 	// Everything else should be gone

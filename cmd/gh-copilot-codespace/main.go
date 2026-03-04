@@ -19,6 +19,7 @@ import (
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
+	"github.com/ekroon/gh-copilot-codespace/internal/workspace"
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -37,10 +38,13 @@ Run Copilot CLI against remote GitHub Codespace(s) via SSH.
 Flags:
   -c, --codespace NAME   Use a specific codespace (repeatable, or comma-separated)
   -w, --workdir PATH     Override workspace directory on the codespace
+      --name SESSION      Name for the local workspace session
+      --resume SESSION    Re-attach to a previous workspace session
 
 Subcommands:
   mcp                    Run as MCP server (used internally by Copilot)
-  exec                   Execute a command on the codespace (used internally).
+  exec                   Execute a command on the codespace (used internally)
+  workspaces             List available workspace sessions
 `)
 }
 
@@ -64,6 +68,15 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "exec" {
 		if err := runExec(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "exec: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// If first arg is "workspaces", list/manage workspace sessions
+	if len(os.Args) > 1 && os.Args[1] == "workspaces" {
+		if err := runWorkspaces(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -165,6 +178,8 @@ func runLauncher(args []string) error {
 	// Parse our flags (consume them, don't pass to copilot)
 	var codespaceNames []string
 	workdirOverride := ""
+	sessionName := ""
+	resumeSession := ""
 	var copilotArgs []string
 	for i := 0; i < len(args); i++ {
 		switch {
@@ -180,9 +195,20 @@ func runLauncher(args []string) error {
 		case (args[i] == "--workdir" || args[i] == "-w") && i+1 < len(args):
 			workdirOverride = args[i+1]
 			i++
+		case args[i] == "--name" && i+1 < len(args):
+			sessionName = args[i+1]
+			i++
+		case args[i] == "--resume" && i+1 < len(args):
+			resumeSession = args[i+1]
+			i++
 		default:
 			copilotArgs = append(copilotArgs, args[i])
 		}
+	}
+
+	// Handle --resume: load workspace and reconnect to codespaces
+	if resumeSession != "" {
+		return runResume(resumeSession, copilotArgs)
 	}
 
 	// The binary serves as both launcher and MCP server
@@ -322,6 +348,21 @@ func runLauncher(args []string) error {
 	_, err = forwardIDEConnections(firstSSHClient, primary.Name, instructionsDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: IDE forwarding failed: %v\n", err)
+	}
+
+	// Save workspace manifest for --resume
+	ws, wsErr := workspace.New(sessionName)
+	if wsErr == nil {
+		for _, cs := range reg.All() {
+			ws.AddCodespace(cs.Alias, workspace.CodespaceEntry{
+				Name:       cs.Name,
+				Repository: cs.Repository,
+				Branch:     cs.Branch,
+				Workdir:    cs.Workdir,
+			})
+		}
+		ws.Save()
+		fmt.Printf("  Session:   %s (resume with --resume %s)\n", ws.Name, ws.Name)
 	}
 
 	fmt.Printf("\nLaunching Copilot CLI with remote codespace tools...\n")
@@ -717,14 +758,20 @@ You are working on a remote GitHub Codespace. Source code lives on the codespace
 }
 
 // cleanMirrorDir removes all contents of the mirror directory except .git/,
+// files/ (user-created artifacts), and workspace.json (session manifest),
 // ensuring stale instruction files don't persist across fetches.
 func cleanMirrorDir(dir string) {
+	preserve := map[string]bool{
+		".git":           true,
+		"files":          true,
+		"workspace.json": true,
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		if e.Name() == ".git" {
+		if preserve[e.Name()] {
 			continue
 		}
 		os.RemoveAll(filepath.Join(dir, e.Name()))
@@ -1180,4 +1227,140 @@ func generateBranchSyncHook(mirrorDir, codespaceName, workdir string, sshClient 
 		return
 	}
 	os.WriteFile(filepath.Join(hooksDir, "branch-sync.json"), data, 0o644)
+}
+
+// runResume loads a workspace session and reconnects to its codespaces.
+func runResume(sessionName string, copilotArgs []string) error {
+	ws, err := workspace.Load(sessionName)
+	if err != nil {
+		return fmt.Errorf("loading workspace %q: %w", sessionName, err)
+	}
+
+	if len(ws.Manifest.Codespaces) == 0 {
+		return fmt.Errorf("workspace %q has no codespaces", sessionName)
+	}
+
+	fmt.Printf("Resuming workspace %q...\n", sessionName)
+
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("finding executable: %w", err)
+	}
+
+	ctx := context.Background()
+	reg := registry.New()
+
+	for alias, entry := range ws.Manifest.Codespaces {
+		fmt.Printf("  Reconnecting %s (%s)...\n", alias, entry.Name)
+
+		// Check if codespace still exists and start if needed
+		if err := startCodespace(entry.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠ Codespace %s unavailable: %v (skipping)\n", alias, err)
+			continue
+		}
+
+		sshClient := ssh.NewClient(entry.Name)
+		if err := sshClient.SetupMultiplexing(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠ SSH failed for %s: %v (skipping)\n", alias, err)
+			continue
+		}
+
+		sshClient.SetWorkdir(entry.Workdir)
+		reg.Register(&registry.ManagedCodespace{
+			Alias:      alias,
+			Name:       entry.Name,
+			Repository: entry.Repository,
+			Branch:     entry.Branch,
+			Workdir:    entry.Workdir,
+			Executor:   sshClient,
+		})
+		fmt.Printf("  ✓ %s connected\n", alias)
+	}
+
+	if reg.Len() == 0 {
+		return fmt.Errorf("no codespaces could be reconnected")
+	}
+
+	// Reuse the workspace directory (don't clean it — preserve local files)
+	instructionsDir := ws.Dir
+
+	// Re-fetch instructions (branches may have changed)
+	if all := reg.All(); len(all) > 0 {
+		primary := all[0]
+		remoteBinary, _ := deployBinary(primary.Executor.(*ssh.Client), primary.Name)
+		fetchInstructionFiles(primary.Executor.(*ssh.Client), primary.Name, primary.Workdir, remoteBinary)
+
+		if reg.Len() > 1 {
+			writeMultiCodespaceInstructionsPreamble(instructionsDir, reg)
+		} else {
+			writeCodespaceInstructionsPreamble(instructionsDir, primary.Workdir)
+		}
+	}
+
+	if err := ensureTrustedFolder(instructionsDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not auto-trust directory: %v\n", err)
+	}
+
+	if err := os.Chdir(instructionsDir); err != nil {
+		return fmt.Errorf("changing to workspace dir: %w", err)
+	}
+
+	mcpConfig := buildMCPConfigWithRegistry(self, reg, nil)
+
+	excludedTools := []string{
+		"bash", "write_bash", "read_bash",
+		"stop_bash", "list_bash", "grep", "glob",
+	}
+
+	fmt.Printf("\nResuming with %d codespace(s)...\n", reg.Len())
+	for _, cs := range reg.All() {
+		fmt.Printf("  %s: %s (%s)\n", cs.Alias, cs.Name, cs.Repository)
+	}
+	fmt.Printf("\n")
+
+	return execCopilot(excludedTools, mcpConfig, copilotArgs)
+}
+
+// runWorkspaces lists or manages workspace sessions.
+func runWorkspaces(args []string) error {
+	// Parse subcommand args
+	deleteTarget := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--delete" && i+1 < len(args) {
+			deleteTarget = args[i+1]
+			i++
+		}
+	}
+
+	if deleteTarget != "" {
+		dir := workspace.WorkspacePath(deleteTarget)
+		if _, err := os.Stat(dir); err != nil {
+			return fmt.Errorf("workspace %q not found", deleteTarget)
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("deleting workspace: %w", err)
+		}
+		fmt.Printf("Deleted workspace %q\n", deleteTarget)
+		return nil
+	}
+
+	// List workspaces
+	list, err := workspace.List()
+	if err != nil {
+		return err
+	}
+
+	if len(list) == 0 {
+		fmt.Println("No workspace sessions found.")
+		return nil
+	}
+
+	fmt.Printf("%-30s %-20s %s\n", "Name", "Created", "Codespaces")
+	fmt.Println(strings.Repeat("-", 60))
+	for _, ws := range list {
+		fmt.Printf("%-30s %-20s %d\n", ws.Name, ws.Created.Format("2006-01-02 15:04"), ws.CodespaceCount)
+	}
+	fmt.Printf("\nResume with: gh copilot-codespace --resume <name>\n")
+	fmt.Printf("Delete with: gh copilot-codespace workspaces --delete <name>\n")
+	return nil
 }
