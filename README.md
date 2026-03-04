@@ -1,21 +1,26 @@
 # gh-copilot-codespace
 
-Launch Copilot CLI with all file/bash operations executing on a remote GitHub Codespace via SSH.
+Launch Copilot CLI with all file/bash operations executing on remote GitHub Codespace(s) via SSH. Supports multiple codespaces, session resume, and on-demand codespace creation.
 
 ## How it works
 
-A single Go binary (`gh-copilot-codespace`) serves three roles:
+A single Go binary (`gh-copilot-codespace`) serves four roles:
 
-1. **Launcher mode** (default) — Lists your codespaces, lets you pick one, starts it if needed, deploys the exec agent, fetches instruction files and project-level components, then launches `copilot` with:
-   - `--excluded-tools` — disables 11 built-in local tools
+1. **Launcher mode** (default) — Lists your codespaces, lets you pick one or more, starts them if needed, deploys the exec agent, fetches instruction files and project-level components, then launches `copilot` with:
+   - `--excluded-tools` — disables local shell/search tools
    - `--additional-mcp-config` — adds itself as the MCP server (plus any remote MCP configs)
 
-2. **MCP server mode** (`gh-copilot-codespace mcp`) — Spawned by copilot, provides 10 remote tools over SSH:
+2. **MCP server mode** (`gh-copilot-codespace mcp`) — Spawned by copilot, provides 17 remote tools over SSH:
    - `remote_view`, `remote_edit`, `remote_create` — file operations
    - `remote_bash` (sync + async), `remote_grep`, `remote_glob` — commands & search
    - `remote_write_bash`, `remote_read_bash`, `remote_stop_bash`, `remote_list_bash` — async session management (tmux-based)
+   - `remote_cd`, `remote_cwd` — working directory navigation
+   - `list_codespaces`, `create_codespace`, `connect_codespace`, `delete_codespace` — codespace lifecycle
+   - `open_shell` — open interactive SSH session
 
 3. **Exec agent** (`gh-copilot-codespace exec`) — Deployed to the codespace at startup. Provides structured command execution with workdir/env setup, replacing fragile shell escaping in SSH forwarding.
+
+4. **Workspace management** (`gh-copilot-codespace workspaces`) — Lists and manages workspace sessions for `--resume`.
 
 ## Prerequisites
 
@@ -39,11 +44,23 @@ go build -o gh-copilot-codespace ./cmd/gh-copilot-codespace
 ## Quick start
 
 ```bash
-# Via gh extension
+# Via gh extension — single codespace (interactive picker)
 gh copilot-codespace
 
-# Or directly (if installed via mise or built from source)
-gh-copilot-codespace
+# Connect to a specific codespace
+gh copilot-codespace -c my-codespace-name
+
+# Connect to multiple codespaces
+gh copilot-codespace -c codespace-1,codespace-2
+
+# Name the session for later resume
+gh copilot-codespace --name my-session
+
+# Resume a previous session
+gh copilot-codespace --resume my-session
+
+# List workspace sessions
+gh copilot-codespace workspaces
 
 # Pass extra copilot flags
 gh copilot-codespace --model claude-sonnet-4.5
@@ -70,24 +87,25 @@ The launcher fetches all project-level Copilot CLI components in a single SSH ca
 
 **MCP servers** are rewritten to forward stdio over SSH, so remote MCP tools appear as local tools to Copilot.
 
-## Known limitations
+## Multi-codespace support
 
-- **`--local-shell` required for local `!` commands** — By default, `!` shell escape commands execute on the codespace via an SSH-forwarded shell patch. If you need `!` commands to run locally, pass `--local-shell`.
+When connecting to multiple codespaces, all `remote_*` MCP tools accept an optional `codespace` parameter (the alias). When only one codespace is connected, this parameter is optional.
 
-## Local `!` shell escape
+The agent can also create, connect to, and delete codespaces on the fly using `create_codespace`, `connect_codespace`, and `delete_codespace` tools.
+
+## Session resume
+
+Workspace sessions are saved to `~/.copilot/workspaces/` with a manifest (`workspace.json`) tracking connected codespaces. Use `--resume` to reconnect:
 
 ```bash
-gh-copilot-codespace --local-shell
+# First session
+gh copilot-codespace --name my-feature -c my-codespace
+
+# Later: resume
+gh copilot-codespace --resume my-feature
 ```
 
-When this flag is set, `!` commands execute locally instead of on the codespace. This uses the native `copilot` binary directly (faster startup, no Node.js dependency).
-
-The default behavior (without `--local-shell`) runs copilot's JS bundle via Node.js with a monkey-patch that intercepts the `!` spawn call and redirects it over SSH (using the same multiplexed connection as the MCP tools).
-
-**Trade-offs of the default (remote shell) mode:**
-- Uses the JS bundle instead of the native binary (slightly slower startup)
-- Relies on a heuristic to detect `!` spawns (`shell: true` + `stdio: "pipe"`)
-- Requires `node` (v24+) in PATH
+Local files created in the workspace `files/` directory persist across sessions.
 
 ## Development
 
