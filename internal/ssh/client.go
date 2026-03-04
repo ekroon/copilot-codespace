@@ -603,13 +603,7 @@ func (c *Client) ForwardSocket(ctx context.Context, localPath, remotePath string
 	// Cancel any existing forwarding for the same spec. Without this,
 	// ssh -O forward silently succeeds when the ControlMaster already has the
 	// forwarding registered, but does NOT recreate a deleted socket file.
-	cancel := exec.CommandContext(ctx, "ssh",
-		"-F", c.sshConfigPath,
-		"-O", "cancel",
-		"-L", fwdSpec,
-		c.sshHost,
-	)
-	cancel.Run() // ignore error — forwarding may not exist yet
+	c.CancelForward(ctx, localPath, remotePath)
 
 	// Remove stale local socket if it exists
 	if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
@@ -630,6 +624,21 @@ func (c *Client) ForwardSocket(ctx context.Context, localPath, remotePath string
 		return fmt.Errorf("ssh forward: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+// CancelForward cancels an active socket forwarding.
+func (c *Client) CancelForward(ctx context.Context, localPath, remotePath string) {
+	if c.sshConfigPath == "" {
+		return
+	}
+	fwdSpec := localPath + ":" + remotePath
+	cancel := exec.CommandContext(ctx, "ssh",
+		"-F", c.sshConfigPath,
+		"-O", "cancel",
+		"-L", fwdSpec,
+		c.sshHost,
+	)
+	cancel.Run() // ignore error — forwarding may not exist
 }
 
 func pathDir(path string) string {
