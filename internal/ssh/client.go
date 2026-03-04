@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Client manages SSH connections to a GitHub Codespace via gh CLI.
@@ -139,20 +140,30 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 		return fmt.Errorf("writing SSH config: %w", err)
 	}
 
-	// Establish master connection in background
-	cmd := exec.CommandContext(ctx, "ssh",
-		"-F", c.sshConfigPath,
-		"-o", "ControlMaster=yes",
-		"-o", "ControlPersist=600",
-		"-fN", // background, no command
-		c.sshHost,
-	)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		// Fall back to non-multiplexed mode
-		fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing failed, using fallback: %v\n", err)
-		c.sshConfigPath = ""
-		return nil
+	// Establish master connection in background (retry once on failure)
+	for attempt := 0; attempt < 2; attempt++ {
+		cmd := exec.CommandContext(ctx, "ssh",
+			"-F", c.sshConfigPath,
+			"-o", "ControlMaster=yes",
+			"-o", "ControlPersist=600",
+			"-fN", // background, no command
+			c.sshHost,
+		)
+		var sshErr bytes.Buffer
+		cmd.Stderr = &sshErr
+		if err := cmd.Run(); err != nil {
+			errDetail := strings.TrimSpace(sshErr.String())
+			if attempt == 0 {
+				fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing attempt 1 failed (%v), retrying...\n", errDetail)
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			// Final attempt failed — fall back to non-multiplexed mode
+			fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing failed, using fallback: %v (%s)\n", err, errDetail)
+			c.sshConfigPath = ""
+			return nil
+		}
+		break
 	}
 
 	fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing established\n")
