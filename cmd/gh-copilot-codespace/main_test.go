@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 )
 
 func TestBuildMCPConfig(t *testing.T) {
@@ -440,4 +442,50 @@ func TestRewriteHooksForSSH_InvalidJSON(t *testing.T) {
 	if result != nil {
 		t.Error("expected nil for invalid JSON")
 	}
+}
+
+func TestBuildMCPConfigWithRegistry(t *testing.T) {
+reg := registry.New()
+reg.Register(&registry.ManagedCodespace{
+Alias:      "github",
+Name:       "cs-abc",
+Repository: "github/github",
+Branch:     "main",
+Workdir:    "/workspaces/github",
+})
+
+result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil)
+
+var parsed map[string]any
+if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+t.Fatalf("invalid JSON: %v", err)
+}
+
+servers := parsed["mcpServers"].(map[string]any)
+cs := servers["codespace"].(map[string]any)
+
+if got := cs["command"]; got != "/usr/local/bin/self" {
+t.Errorf("command = %v, want /usr/local/bin/self", got)
+}
+
+env, ok := cs["env"].(map[string]any)
+if !ok {
+t.Fatal("missing env key")
+}
+
+registryJSON, ok := env["CODESPACE_REGISTRY"].(string)
+if !ok || registryJSON == "" {
+t.Fatal("missing CODESPACE_REGISTRY env var")
+}
+
+var entries []registryEntry
+if err := json.Unmarshal([]byte(registryJSON), &entries); err != nil {
+t.Fatalf("invalid CODESPACE_REGISTRY JSON: %v", err)
+}
+if len(entries) != 1 {
+t.Fatalf("got %d entries, want 1", len(entries))
+}
+if entries[0].Alias != "github" {
+t.Errorf("alias = %q, want %q", entries[0].Alias, "github")
+}
 }
