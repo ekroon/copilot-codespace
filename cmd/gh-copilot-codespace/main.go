@@ -40,6 +40,7 @@ Flags:
   -w, --workdir PATH     Override workspace directory on the codespace
       --name SESSION      Name for the local workspace session
       --resume SESSION    Re-attach to a previous workspace session
+      --local-bash        Keep the local bash tool enabled alongside remote_bash
 
 Subcommands:
   mcp                    Run as MCP server (used internally by Copilot)
@@ -180,9 +181,12 @@ func runLauncher(args []string) error {
 	workdirOverride := ""
 	sessionName := ""
 	resumeSession := ""
+	localBash := false
 	var copilotArgs []string
 	for i := 0; i < len(args); i++ {
 		switch {
+		case args[i] == "--local-bash":
+			localBash = true
 		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
 			// Support comma-separated: -c cs1,cs2
 			for _, name := range strings.Split(args[i+1], ",") {
@@ -340,8 +344,11 @@ func runLauncher(args []string) error {
 
 	// Excluded tools
 	excludedTools := []string{
-		"bash", "write_bash", "read_bash",
+		"write_bash", "read_bash",
 		"stop_bash", "list_bash", "grep", "glob",
+	}
+	if !localBash {
+		excludedTools = append([]string{"bash"}, excludedTools...)
 	}
 
 	// Forward IDE connections from the primary codespace
