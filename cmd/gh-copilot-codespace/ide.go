@@ -37,7 +37,7 @@ const forwardedLockPrefix = "copilot-codespace-"
 // Stale forwarded lock files from previous runs are cleaned up on startup (by checking
 // if the PID in the lock file is still running). This is necessary because syscall.Exec
 // replaces the process, preventing defer-based cleanup.
-func forwardIDEConnections(sshClient *ssh.Client, codespaceName, localWorkdir string) (int, error) {
+func forwardIDEConnections(sshClient *ssh.Client, codespaceName, localWorkdir, remoteWorkdir string) (int, error) {
 	if sshClient.SSHConfigPath() == "" {
 		return 0, nil // no multiplexing, skip silently
 	}
@@ -122,7 +122,7 @@ func forwardIDEConnections(sshClient *ssh.Client, codespaceName, localWorkdir st
 			PID:              os.Getpid(), // becomes copilot's PID after syscall.Exec
 			IDEName:          lf.IDEName,
 			Timestamp:        time.Now().UnixMilli(),
-			WorkspaceFolders: []string{localWorkdir},
+			WorkspaceFolders: []string{remoteWorkdir},
 			IsTrusted:        lf.IsTrusted,
 		}
 

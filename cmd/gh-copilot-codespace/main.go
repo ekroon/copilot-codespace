@@ -354,10 +354,14 @@ func runLauncher(args []string) error {
 		excludedTools = append([]string{"bash"}, excludedTools...)
 	}
 
-	// Forward IDE connections from the primary codespace
-	_, err = forwardIDEConnections(firstSSHClient, primary.Name, instructionsDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: IDE forwarding failed: %v\n", err)
+	// Forward IDE connections from all connected codespaces
+	for _, cs := range reg.All() {
+		if sshClient, ok := cs.Executor.(*ssh.Client); ok && sshClient.SSHConfigPath() != "" {
+			_, err = forwardIDEConnections(sshClient, cs.Name, instructionsDir, cs.Workdir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: IDE forwarding failed for %s: %v\n", cs.Alias, err)
+			}
+		}
 	}
 
 	// Save workspace manifest for --resume
