@@ -85,7 +85,7 @@ func forwardIDEConnections(sshClient *ssh.Client, codespaceName, localWorkdir, r
 			sshClient.CancelForward(ctx, localSocket, lf.SocketPath)
 			os.Remove(localSocket)
 
-			// Re-fetch lock files to get updated socket paths
+			// Re-fetch lock files to get updated socket paths and auth nonces
 			freshLocks, err := fetchIDELockFiles(sshClient, codespaceName)
 			if err == nil {
 				if freshLF, ok := freshLocks[name]; ok && freshLF.SocketPath != lf.SocketPath {
@@ -101,6 +101,10 @@ func forwardIDEConnections(sshClient *ssh.Client, codespaceName, localWorkdir, r
 				} else {
 					// Same socket path — retry forwarding (tunnel may have been stale)
 					if err := sshClient.ForwardSocket(ctx, localSocket, lf.SocketPath); err == nil && probeSocket(localSocket) {
+						// Use fresh headers (nonce may have changed even if socket path didn't)
+						if freshLF, ok := freshLocks[name]; ok {
+							lf = freshLF
+						}
 						fmt.Fprintf(os.Stderr, "  ✓ IDE socket for %s recovered (re-forwarded)\n", lf.IDEName)
 					} else {
 						os.Remove(localSocket)
@@ -111,6 +115,16 @@ func forwardIDEConnections(sshClient *ssh.Client, codespaceName, localWorkdir, r
 			} else {
 				fmt.Fprintf(os.Stderr, "  ⚠ IDE %s: could not re-fetch lock files, skipping\n", lf.IDEName)
 				continue
+			}
+		} else {
+			// Socket probe passed — but nonce may still be stale (VS Code restarted
+			// with new nonce but same socket path). Re-fetch to get fresh headers.
+			freshLocks, err := fetchIDELockFiles(sshClient, codespaceName)
+			if err == nil {
+				if freshLF, ok := freshLocks[name]; ok {
+					lf.Headers = freshLF.Headers
+					lf.Timestamp = freshLF.Timestamp
+				}
 			}
 		}
 
