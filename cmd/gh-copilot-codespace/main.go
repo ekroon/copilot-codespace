@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
-	"github.com/ekroon/gh-copilot-codespace/internal/shellpatch"
+	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -32,12 +32,11 @@ type codespace struct {
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: gh copilot-codespace [flags] [-- copilot-args...]
 
-Run Copilot CLI against a remote GitHub Codespace via SSH.
+Run Copilot CLI against remote GitHub Codespace(s) via SSH.
 
 Flags:
-  -c, --codespace NAME   Use a specific codespace (skip interactive picker)
+  -c, --codespace NAME   Use a specific codespace (repeatable, or comma-separated)
   -w, --workdir PATH     Override workspace directory on the codespace
-      --local-shell      Keep shell commands running locally
 
 Subcommands:
   mcp                    Run as MCP server (used internally by Copilot)
@@ -78,42 +77,105 @@ func main() {
 }
 
 func runMCPServer() {
-	codespaceName := os.Getenv("CODESPACE_NAME")
-	if codespaceName == "" {
-		fmt.Fprintln(os.Stderr, "CODESPACE_NAME environment variable is required")
-		os.Exit(1)
+	// Support multi-codespace via CODESPACE_REGISTRY env var (JSON)
+	// Falls back to single CODESPACE_NAME for backward compatibility
+	registryJSON := os.Getenv("CODESPACE_REGISTRY")
+
+	var reg *registry.Registry
+	if registryJSON != "" {
+		var err error
+		reg, err = registryFromJSON(registryJSON)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "codespace-mcp: invalid CODESPACE_REGISTRY: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		codespaceName := os.Getenv("CODESPACE_NAME")
+		if codespaceName == "" {
+			fmt.Fprintln(os.Stderr, "CODESPACE_NAME or CODESPACE_REGISTRY environment variable is required")
+			os.Exit(1)
+		}
+		sshClient := ssh.NewClient(codespaceName)
+		ctx := context.Background()
+		if err := sshClient.SetupMultiplexing(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "codespace-mcp: multiplexing setup warning: %v\n", err)
+		}
+		workdir := os.Getenv("CODESPACE_WORKDIR")
+		reg = registry.New()
+		reg.Register(&registry.ManagedCodespace{
+			Alias:    registry.DefaultAlias(codespaceName, nil),
+			Name:     codespaceName,
+			Workdir:  workdir,
+			Executor: sshClient,
+		})
 	}
 
-	sshClient := ssh.NewClient(codespaceName)
-
-	// Establish SSH multiplexing for fast command execution
-	ctx := context.Background()
-	if err := sshClient.SetupMultiplexing(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "codespace-mcp: multiplexing setup warning: %v\n", err)
-	}
-
-	mcpServer := mcp.NewServerSingle(sshClient, codespaceName)
+	mcpServer := mcp.NewServer(reg)
 
 	log.SetOutput(os.Stderr)
-	log.Printf("codespace-mcp: starting for codespace %q", codespaceName)
+	log.Printf("codespace-mcp: starting with %d codespace(s)", reg.Len())
 
 	if err := server.ServeStdio(mcpServer); err != nil {
 		log.Fatalf("codespace-mcp: server error: %v", err)
 	}
 }
 
+// registryEntry is the JSON-serializable form of a codespace for MCP config env.
+type registryEntry struct {
+	Alias      string `json:"alias"`
+	Name       string `json:"name"`
+	Repository string `json:"repository"`
+	Branch     string `json:"branch"`
+	Workdir    string `json:"workdir"`
+}
+
+// registryFromJSON deserializes CODESPACE_REGISTRY env var and creates SSH clients.
+func registryFromJSON(data string) (*registry.Registry, error) {
+	var entries []registryEntry
+	if err := json.Unmarshal([]byte(data), &entries); err != nil {
+		return nil, fmt.Errorf("parsing registry: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("empty registry")
+	}
+
+	reg := registry.New()
+	ctx := context.Background()
+	for _, e := range entries {
+		sshClient := ssh.NewClient(e.Name)
+		if err := sshClient.SetupMultiplexing(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "codespace-mcp: multiplexing warning for %s: %v\n", e.Alias, err)
+		}
+		if e.Workdir != "" {
+			sshClient.SetWorkdir(e.Workdir)
+		}
+		reg.Register(&registry.ManagedCodespace{
+			Alias:      e.Alias,
+			Name:       e.Name,
+			Repository: e.Repository,
+			Branch:     e.Branch,
+			Workdir:    e.Workdir,
+			Executor:   sshClient,
+		})
+	}
+	return reg, nil
+}
+
 func runLauncher(args []string) error {
 	// Parse our flags (consume them, don't pass to copilot)
-	localShell := false
-	codespaceName := ""
+	var codespaceNames []string
 	workdirOverride := ""
 	var copilotArgs []string
 	for i := 0; i < len(args); i++ {
 		switch {
-		case args[i] == "--local-shell":
-			localShell = true
 		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
-			codespaceName = args[i+1]
+			// Support comma-separated: -c cs1,cs2
+			for _, name := range strings.Split(args[i+1], ",") {
+				name = strings.TrimSpace(name)
+				if name != "" {
+					codespaceNames = append(codespaceNames, name)
+				}
+			}
 			i++
 		case (args[i] == "--workdir" || args[i] == "-w") && i+1 < len(args):
 			workdirOverride = args[i+1]
@@ -129,10 +191,11 @@ func runLauncher(args []string) error {
 		return fmt.Errorf("finding executable: %w", err)
 	}
 
-	// Select codespace: use --codespace flag or interactive picker
+	// Select codespace(s): use --codespace flag(s) or interactive picker
 	var selected codespace
-	if codespaceName != "" {
-		selected, err = lookupCodespace(codespaceName)
+	if len(codespaceNames) > 0 {
+		// Use first codespace name for now (multi-connect handled by buildMCPConfig)
+		selected, err = lookupCodespace(codespaceNames[0])
 	} else {
 		selected, err = selectCodespace()
 	}
@@ -230,20 +293,11 @@ func runLauncher(args []string) error {
 		fmt.Printf("  Branch:    %s\n", branch)
 	}
 	fmt.Printf("  Excluded:  %d local tools\n", len(excludedTools))
-	if localShell {
-		fmt.Printf("  Shell:     ! commands execute locally (--local-shell)\n")
-	} else {
-		fmt.Printf("  Shell:     ! commands execute on codespace\n")
-	}
 	fmt.Printf("\n  Shell access (from another terminal):\n")
 	fmt.Printf("    gh codespace ssh -c %s\n\n", selected.Name)
 
-	// Exec copilot from the instructions dir (cwd is already set)
-	if localShell {
-		return execCopilot(excludedTools, mcpConfig, copilotArgs)
-	}
-	// Default: use shell patch so "!" commands run on the codespace
-	return execCopilotWithShellPatch(excludedTools, mcpConfig, copilotArgs, sshClient, workdir, instructionsDir)
+	// Exec copilot
+	return execCopilot(excludedTools, mcpConfig, copilotArgs)
 }
 
 // lookupCodespace finds a codespace by name (exact or prefix match).
@@ -955,104 +1009,6 @@ func execCopilot(excludedTools []string, mcpConfig string, extraArgs []string) e
 	// Use "--" so gh doesn't interpret copilot's flags
 	args := append([]string{"gh", "copilot", "--"}, copilotArgs...)
 	return syscall.Exec(ghPath, args, os.Environ())
-}
-
-// execCopilotWithShellPatch runs copilot's JS bundle via node with a require
-// patch that intercepts the "!" shell escape and redirects it over SSH.
-// This bypasses the native binary so the CJS patch can monkey-patch spawn.
-// If the copilot binary is not in PATH (e.g. using gh copilot), falls back
-// to execCopilot with a warning since the shell patch requires index.js.
-func execCopilotWithShellPatch(excludedTools []string, mcpConfig string, extraArgs []string, sshClient *ssh.Client, workdir, mirrorDir string) error {
-	// Find copilot's index.js (the JS bundle) — requires copilot in PATH
-	indexJS, err := findCopilotIndexJS()
-	if err != nil {
-		// Shell patch needs the copilot JS bundle which isn't available via gh copilot.
-		// Fall back to execCopilot (which handles gh copilot fallback).
-		fmt.Fprintf(os.Stderr, "Warning: shell patch unavailable (%v); '!' commands will run locally\n", err)
-		return execCopilot(excludedTools, mcpConfig, extraArgs)
-	}
-
-	// Write the CJS patch to a temp file
-	patchPath, err := shellpatch.WritePatch()
-	if err != nil {
-		return fmt.Errorf("writing shell patch: %w", err)
-	}
-	defer os.RemoveAll(filepath.Dir(patchPath))
-
-	// Find node binary
-	nodePath, err := exec.LookPath("node")
-	if err != nil {
-		return fmt.Errorf("node not found in PATH: %w", err)
-	}
-
-	// Build args: node --require <patch.cjs> <index.js> <copilot-args...>
-	args := []string{"node", "--require", patchPath, indexJS,
-		"--excluded-tools",
-	}
-	args = append(args, excludedTools...)
-	args = append(args, "--additional-mcp-config", mcpConfig)
-	args = append(args, extraArgs...)
-
-	// Add SSH connection info and workdir to env for the patch script
-	env := os.Environ()
-	if sshClient.SSHConfigPath() != "" {
-		env = append(env, "COPILOT_SSH_CONFIG="+sshClient.SSHConfigPath())
-		env = append(env, "COPILOT_SSH_HOST="+sshClient.SSHHost())
-	}
-	env = append(env, "CODESPACE_WORKDIR="+workdir)
-	env = append(env, "CODESPACE_MIRROR_DIR="+mirrorDir)
-
-	// Pre-fetch the auth token from keychain so node doesn't trigger a
-	// macOS keychain prompt (the keychain ACL only trusts the native binary).
-	if token := readCopilotToken(); token != "" {
-		env = append(env, "COPILOT_GITHUB_TOKEN="+token)
-	}
-
-	return syscall.Exec(nodePath, args, env)
-}
-
-// findCopilotIndexJS locates copilot's index.js by following the symlink chain
-// from the `copilot` binary → npm-loader.js → index.js in the same directory.
-func findCopilotIndexJS() (string, error) {
-	copilotPath, err := exec.LookPath("copilot")
-	if err != nil {
-		return "", fmt.Errorf("copilot not found in PATH: %w", err)
-	}
-
-	// Resolve symlinks to get the actual npm-loader.js path
-	realPath, err := filepath.EvalSymlinks(copilotPath)
-	if err != nil {
-		return "", fmt.Errorf("resolving copilot path: %w", err)
-	}
-
-	// index.js is in the same directory as npm-loader.js
-	dir := filepath.Dir(realPath)
-	indexJS := filepath.Join(dir, "index.js")
-
-	if _, err := os.Stat(indexJS); err != nil {
-		return "", fmt.Errorf("copilot index.js not found at %s", indexJS)
-	}
-
-	return indexJS, nil
-}
-
-// readCopilotToken obtains a GitHub token for copilot auth.
-// Uses `gh auth token` to avoid macOS keychain popups (the keychain ACL
-// only trusts the native copilot binary, not node).
-// Returns empty string on any failure.
-func readCopilotToken() string {
-	// Skip if already set via env
-	for _, key := range []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"} {
-		if os.Getenv(key) != "" {
-			return ""
-		}
-	}
-
-	out, err := exec.Command("gh", "auth", "token").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
 }
 
 // detectRemoteBranch reads the current git branch from the codespace via SSH.
