@@ -5,15 +5,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/provisioner"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
+
+// DeployFunc deploys the exec agent binary to a codespace.
+// Returns the remote path to the deployed binary, or error.
+type DeployFunc func(sshClient *ssh.Client, codespaceName string) (string, error)
+
+// LifecycleConfig holds dependencies for lifecycle tool handlers.
+type LifecycleConfig struct {
+	GHRunner     GHRunner
+	DeployFunc   DeployFunc               // optional: deploy exec agent after SSH setup
+	Provisioners []provisioner.Provisioner // optional: run after setup
+}
 
 // --- create_codespace ---
 
@@ -58,7 +71,7 @@ func createCodespaceTool() mcpsdk.Tool {
 	}
 }
 
-func createCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.ToolHandlerFunc {
+func createCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		repo, err := requiredString(req, "repository")
 		if err != nil {
@@ -105,7 +118,7 @@ func createCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.To
 		}
 
 		// Create the codespace
-		output, err := ghRunner.Run(ctx, args...)
+		output, err := cfg.GHRunner.Run(ctx, args...)
 		if err != nil {
 			errMsg := err.Error()
 			// Check for permissions authorization required — extract URL for user
@@ -129,7 +142,7 @@ func createCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.To
 
 		// Wait for SSH readiness
 		for i := 0; i < 30; i++ {
-			checkOut, err := ghRunner.Run(ctx, "codespace", "ssh", "-c", csName, "--", "echo ready")
+			checkOut, err := cfg.GHRunner.Run(ctx, "codespace", "ssh", "-c", csName, "--", "echo ready")
 			if err == nil && strings.Contains(checkOut, "ready") {
 				break
 			}
@@ -143,6 +156,17 @@ func createCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.To
 		sshClient := ssh.NewClient(csName)
 		if err := sshClient.SetupMultiplexing(ctx); err != nil {
 			return toolError(fmt.Sprintf("SSH multiplexing failed: %v", err)), nil
+		}
+
+		// Deploy exec agent binary
+		var execAgent string
+		if cfg.DeployFunc != nil {
+			remotePath, err := cfg.DeployFunc(sshClient, csName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy failed: %v\n", err)
+			} else {
+				execAgent = remotePath
+			}
 		}
 
 		// Detect workdir
@@ -164,9 +188,21 @@ func createCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.To
 			Branch:     branch,
 			Workdir:    workdir,
 			Executor:   sshClient,
+			ExecAgent:  execAgent,
 		}
 		if err := reg.Register(cs); err != nil {
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil
+		}
+
+		// Run provisioners
+		if len(cfg.Provisioners) > 0 {
+			target := &csTarget{name: csName, repo: repo, workdir: workdir, client: sshClient}
+			rctx := provisioner.RunContext{
+				Terminal:       os.Getenv("TERM"),
+				Repository:     repo,
+				IsNewCodespace: true,
+			}
+			provisioner.RunAll(ctx, cfg.Provisioners, rctx, target)
 		}
 
 		return toolSuccess(fmt.Sprintf("Created and connected codespace %q (alias: %s)\nRepository: %s\nWorkdir: %s",
@@ -232,7 +268,7 @@ func connectCodespaceTool() mcpsdk.Tool {
 	}
 }
 
-func connectCodespaceHandler(reg *registry.Registry) server.ToolHandlerFunc {
+func connectCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		csName, err := requiredString(req, "name")
 		if err != nil {
@@ -257,6 +293,17 @@ func connectCodespaceHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			return toolError(fmt.Sprintf("SSH setup failed: %v", err)), nil
 		}
 
+		// Deploy exec agent binary
+		var execAgent string
+		if cfg.DeployFunc != nil {
+			remotePath, err := cfg.DeployFunc(sshClient, csName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  ⚠ exec agent deploy failed for %s: %v\n", csName, err)
+			} else {
+				execAgent = remotePath
+			}
+		}
+
 		workdir := detectCSWorkdir(ctx, sshClient, repoInfo)
 
 		cs := &registry.ManagedCodespace{
@@ -265,9 +312,21 @@ func connectCodespaceHandler(reg *registry.Registry) server.ToolHandlerFunc {
 			Repository: repoInfo,
 			Workdir:    workdir,
 			Executor:   sshClient,
+			ExecAgent:  execAgent,
 		}
 		if err := reg.Register(cs); err != nil {
 			return toolError(fmt.Sprintf("registration failed: %v", err)), nil
+		}
+
+		// Run provisioners
+		if len(cfg.Provisioners) > 0 {
+			target := &csTarget{name: csName, repo: repoInfo, workdir: workdir, client: sshClient}
+			rctx := provisioner.RunContext{
+				Terminal:       os.Getenv("TERM"),
+				Repository:     repoInfo,
+				IsNewCodespace: false,
+			}
+			provisioner.RunAll(ctx, cfg.Provisioners, rctx, target)
 		}
 
 		return toolSuccess(fmt.Sprintf("Connected to codespace %q (alias: %s)\nWorkdir: %s", csName, alias, workdir)), nil
@@ -373,6 +432,28 @@ func (r *RealGHRunner) Run(ctx context.Context, args ...string) (string, error) 
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+// csTarget adapts an ssh.Client to the provisioner.CodespaceTarget interface.
+type csTarget struct {
+	name    string
+	repo    string
+	workdir string
+	client  *ssh.Client
+}
+
+func (t *csTarget) CodespaceName() string { return t.name }
+func (t *csTarget) Repository() string    { return t.repo }
+func (t *csTarget) Workdir() string       { return t.workdir }
+func (t *csTarget) RunSSH(ctx context.Context, command string) (string, error) {
+	stdout, stderr, exitCode, err := t.client.Exec(ctx, command)
+	if err != nil {
+		return "", err
+	}
+	if exitCode != 0 {
+		return stdout, fmt.Errorf("exit %d: %s", exitCode, strings.TrimSpace(stderr))
+	}
+	return stdout, nil
 }
 
 // extractURL finds the first https://github.com/... URL in a string.

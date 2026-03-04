@@ -107,6 +107,42 @@ gh copilot-codespace --resume my-feature
 
 Local files created in the workspace `files/` directory persist across sessions.
 
+## Custom provisioners
+
+Provisioners run custom setup on codespaces after connection or creation. Built-in provisioners handle terminal info upload and git fetch automatically.
+
+Add custom provisioners in `~/.config/copilot-codespace/provisioners.json`:
+
+```json
+{
+  "provisioners": [
+    {
+      "name": "ghostty-terminfo",
+      "bash": "infocmp -x xterm-ghostty 2>/dev/null | tic -x - 2>/dev/null",
+      "match": { "terminal": "xterm-ghostty" }
+    },
+    {
+      "name": "my-dotfiles",
+      "bash": "curl -fsSL https://raw.githubusercontent.com/me/dotfiles/main/setup.sh | bash"
+    },
+    {
+      "name": "github-setup",
+      "bash": "cd /workspaces/github && bin/setup",
+      "match": { "repository": "github/github" }
+    }
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `name` | Provisioner name (shown in logs) |
+| `bash` | Command to run on the codespace via SSH |
+| `match.terminal` | Only run when `$TERM` matches (e.g., `"xterm-ghostty"`) |
+| `match.repository` | Only run for this repository (e.g., `"github/github"`) |
+
+Provisioners without `match` run on every codespace. Errors are logged but don't block connection.
+
 ## Development
 
 ### Running tests

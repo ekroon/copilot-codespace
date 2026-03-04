@@ -40,7 +40,7 @@ func (m *mockGHRunner) Run(_ context.Context, args ...string) (string, error) {
 func TestCreateCodespaceHandler_MissingRepo(t *testing.T) {
 	reg := registry.New()
 	gh := &mockGHRunner{}
-	handler := createCodespaceHandler(reg, gh)
+	handler := createCodespaceHandler(reg, LifecycleConfig{GHRunner: gh})
 
 	res, _ := handler(context.Background(), makeReq(map[string]any{}))
 	if !res.IsError {
@@ -56,7 +56,7 @@ func TestCreateCodespaceHandler_AliasConflict(t *testing.T) {
 	reg.Register(&registry.ManagedCodespace{Alias: "github", Name: "cs-old", Executor: &mockExecutor{}})
 
 	gh := &mockGHRunner{}
-	handler := createCodespaceHandler(reg, gh)
+	handler := createCodespaceHandler(reg, LifecycleConfig{GHRunner: gh})
 
 	res, _ := handler(context.Background(), makeReq(map[string]any{
 		"repository": "github/github",
@@ -77,7 +77,7 @@ func TestCreateCodespaceHandler_CreateFails(t *testing.T) {
 			"codespace create": {output: "error", err: fmt.Errorf("quota exceeded")},
 		},
 	}
-	handler := createCodespaceHandler(reg, gh)
+	handler := createCodespaceHandler(reg, LifecycleConfig{GHRunner: gh})
 
 	res, _ := handler(context.Background(), makeReq(map[string]any{
 		"repository": "github/github",
@@ -154,7 +154,7 @@ func TestDeleteCodespaceHandler_NotFound(t *testing.T) {
 
 func TestConnectCodespaceHandler_MissingName(t *testing.T) {
 	reg := registry.New()
-	handler := connectCodespaceHandler(reg)
+	handler := connectCodespaceHandler(reg, LifecycleConfig{})
 
 	res, _ := handler(context.Background(), makeReq(map[string]any{}))
 	if !res.IsError {
@@ -218,7 +218,7 @@ func TestCreateCodespaceHandler_PermissionsError(t *testing.T) {
 			},
 		},
 	}
-	handler := createCodespaceHandler(reg, gh)
+	handler := createCodespaceHandler(reg, LifecycleConfig{GHRunner: gh})
 
 	res, _ := handler(context.Background(), makeReq(map[string]any{
 		"repository": "github/github",
@@ -243,7 +243,7 @@ func TestCreateCodespaceHandler_DefaultPermissions(t *testing.T) {
 			"codespace ssh":    {output: "ready", err: nil},
 		},
 	}
-	handler := createCodespaceHandler(reg, gh)
+	handler := createCodespaceHandler(reg, LifecycleConfig{GHRunner: gh})
 
 	// With default_permissions=true, --default-permissions should be in args
 	handler(context.Background(), makeReq(map[string]any{

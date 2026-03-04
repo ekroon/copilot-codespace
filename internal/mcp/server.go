@@ -17,8 +17,17 @@ import (
 
 // NewServer creates and configures the MCP server with all remote tools.
 // Uses a registry to support multiple codespaces.
-func NewServer(reg *registry.Registry) *server.MCPServer {
+func NewServer(reg *registry.Registry, lcfg ...LifecycleConfig) *server.MCPServer {
 	s := server.NewMCPServer("codespace-mcp", "0.2.0")
+
+	// Default lifecycle config
+	var cfg LifecycleConfig
+	if len(lcfg) > 0 {
+		cfg = lcfg[0]
+	}
+	if cfg.GHRunner == nil {
+		cfg.GHRunner = &RealGHRunner{}
+	}
 
 	s.AddTool(viewTool(), viewHandler(reg))
 	s.AddTool(editTool(), editHandler(reg))
@@ -34,11 +43,11 @@ func NewServer(reg *registry.Registry) *server.MCPServer {
 	s.AddTool(cdTool(), cdHandler(reg))
 	s.AddTool(cwdTool(), cwdHandler(reg))
 	s.AddTool(listCodespacesTool(), listCodespacesHandler(reg))
-	s.AddTool(listAvailableCodespacesTool(), listAvailableCodespacesHandler(&RealGHRunner{}))
-	s.AddTool(getCodespaceOptionsTool(), getCodespaceOptionsHandler(&RealGHRunner{}))
-	s.AddTool(createCodespaceTool(), createCodespaceHandler(reg, &RealGHRunner{}))
-	s.AddTool(connectCodespaceTool(), connectCodespaceHandler(reg))
-	s.AddTool(deleteCodespaceTool(), deleteCodespaceHandler(reg, &RealGHRunner{}))
+	s.AddTool(listAvailableCodespacesTool(), listAvailableCodespacesHandler(cfg.GHRunner))
+	s.AddTool(getCodespaceOptionsTool(), getCodespaceOptionsHandler(cfg.GHRunner))
+	s.AddTool(createCodespaceTool(), createCodespaceHandler(reg, cfg))
+	s.AddTool(connectCodespaceTool(), connectCodespaceHandler(reg, cfg))
+	s.AddTool(deleteCodespaceTool(), deleteCodespaceHandler(reg, cfg.GHRunner))
 
 	return s
 }
