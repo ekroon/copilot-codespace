@@ -20,7 +20,7 @@ import (
 func createCodespaceTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "create_codespace",
-		Description: "Create a new GitHub Codespace, wait for it to be ready, and connect to it. The new codespace becomes available for all remote_* tools.",
+		Description: "Create a new GitHub Codespace, wait for it to be ready, and connect to it. Use get_codespace_options first to see available machine types and devcontainer configs for the repository.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
@@ -34,15 +34,19 @@ func createCodespaceTool() mcpsdk.Tool {
 				},
 				"machine_type": map[string]any{
 					"type":        "string",
-					"description": "Machine type (e.g., 'standardLinux32gb', 'xLargePremiumLinux'). Defaults to repository's default.",
+					"description": "Machine type name from get_codespace_options (e.g., 'xLargePremiumLinux')",
 				},
 				"display_name": map[string]any{
 					"type":        "string",
-					"description": "Display name for the codespace (optional, defaults to branch name)",
+					"description": "Display name for the codespace (max 48 chars, defaults to branch name)",
 				},
 				"devcontainer_path": map[string]any{
 					"type":        "string",
-					"description": "Path to devcontainer.json (e.g., '.devcontainer/devcontainer.json'). Required for repos with multiple devcontainer configs.",
+					"description": "Path to devcontainer.json from get_codespace_options (e.g., '.devcontainer/devcontainer.json')",
+				},
+				"default_permissions": map[string]any{
+					"type":        "boolean",
+					"description": "Use default permissions without authorization prompt (default: false). Set to true only if the user explicitly agrees to skip the permissions review.",
 				},
 				"alias": map[string]any{
 					"type":        "string",
@@ -67,6 +71,13 @@ func createCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.To
 		devcontainerPath := optionalString(req, "devcontainer_path")
 		alias := optionalString(req, "alias")
 
+		defaultPerms := false
+		if raw, ok := req.GetArguments()["default_permissions"]; ok {
+			if b, ok := raw.(bool); ok {
+				defaultPerms = b
+			}
+		}
+
 		if alias == "" {
 			alias = registry.DefaultAlias(repo, reg.Aliases())
 		}
@@ -77,7 +88,10 @@ func createCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.To
 		}
 
 		// Build gh cs create command
-		args := []string{"codespace", "create", "-R", repo, "--default-permissions"}
+		args := []string{"codespace", "create", "-R", repo}
+		if defaultPerms {
+			args = append(args, "--default-permissions")
+		}
 		if machineType != "" {
 			args = append(args, "-m", machineType)
 		}
@@ -93,7 +107,19 @@ func createCodespaceHandler(reg *registry.Registry, ghRunner GHRunner) server.To
 		// Create the codespace
 		output, err := ghRunner.Run(ctx, args...)
 		if err != nil {
-			return toolError(fmt.Sprintf("failed to create codespace: %v\n%s", err, output)), nil
+			errMsg := err.Error()
+			// Check for permissions authorization required — extract URL for user
+			if strings.Contains(errMsg, "authorize or deny additional permissions") ||
+				strings.Contains(errMsg, "You must authorize") {
+				authURL := extractURL(errMsg)
+				msg := "Codespace creation requires additional permissions authorization.\n"
+				if authURL != "" {
+					msg += fmt.Sprintf("\nPlease open this URL to authorize: %s\n", authURL)
+				}
+				msg += "\nAfter authorizing, retry create_codespace. Or set default_permissions=true to skip the review."
+				return toolError(msg), nil
+			}
+			return toolError(fmt.Sprintf("failed to create codespace: %v", err)), nil
 		}
 
 		csName := strings.TrimSpace(output)
@@ -347,4 +373,85 @@ func (r *RealGHRunner) Run(ctx context.Context, args ...string) (string, error) 
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+// extractURL finds the first https://github.com/... URL in a string.
+func extractURL(s string) string {
+	for _, word := range strings.Fields(s) {
+		if strings.HasPrefix(word, "https://github.com/") {
+			return strings.TrimRight(word, ".,;:!?)")
+		}
+	}
+	return ""
+}
+
+// --- get_codespace_options ---
+
+func getCodespaceOptionsTool() mcpsdk.Tool {
+	return mcpsdk.Tool{
+		Name:        "get_codespace_options",
+		Description: "Get available machine types and devcontainer configurations for a repository. Use this before create_codespace to see what options are available.",
+		InputSchema: mcpsdk.ToolInputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"repository": map[string]any{
+					"type":        "string",
+					"description": "Repository in owner/repo format (e.g., 'github/github')",
+				},
+			},
+			Required: []string{"repository"},
+		},
+	}
+}
+
+func getCodespaceOptionsHandler(ghRunner GHRunner) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		repo, err := requiredString(req, "repository")
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+
+		var sb strings.Builder
+
+		// Fetch machine types
+		machineOutput, err := ghRunner.Run(ctx, "api",
+			fmt.Sprintf("/repos/%s/codespaces/machines", repo),
+			"--jq", `.machines[] | "\(.name)\t\(.display_name)\t\(.cpus)\t\(.memory_in_bytes / 1073741824 | floor)GB\t\(.storage_in_bytes / 1073741824 | floor)GB"`)
+		if err != nil {
+			sb.WriteString(fmt.Sprintf("Machine types: could not fetch (%v)\n", err))
+		} else {
+			sb.WriteString("## Machine Types\n\n")
+			sb.WriteString(fmt.Sprintf("%-30s %-40s %-6s %-8s %s\n", "Name", "Display Name", "CPUs", "RAM", "Storage"))
+			sb.WriteString(strings.Repeat("-", 100) + "\n")
+			for _, line := range strings.Split(strings.TrimSpace(machineOutput), "\n") {
+				parts := strings.SplitN(line, "\t", 5)
+				if len(parts) == 5 {
+					sb.WriteString(fmt.Sprintf("%-30s %-40s %-6s %-8s %s\n",
+						parts[0], parts[1], parts[2], parts[3], parts[4]))
+				}
+			}
+		}
+
+		// Fetch devcontainer configs
+		dcOutput, err := ghRunner.Run(ctx, "api",
+			fmt.Sprintf("/repos/%s/codespaces/devcontainers", repo),
+			"--jq", `.devcontainers[] | "\(.path)\t\(.display_name // .name // "(default)")"`)
+		if err != nil {
+			sb.WriteString(fmt.Sprintf("\nDevcontainer configs: could not fetch (%v)\n", err))
+		} else if strings.TrimSpace(dcOutput) != "" {
+			sb.WriteString("\n## Devcontainer Configs\n\n")
+			sb.WriteString(fmt.Sprintf("%-60s %s\n", "Path", "Display Name"))
+			sb.WriteString(strings.Repeat("-", 80) + "\n")
+			for _, line := range strings.Split(strings.TrimSpace(dcOutput), "\n") {
+				parts := strings.SplitN(line, "\t", 2)
+				if len(parts) == 2 {
+					sb.WriteString(fmt.Sprintf("%-60s %s\n", parts[0], parts[1]))
+				}
+			}
+		}
+
+		sb.WriteString(fmt.Sprintf("\nUse these values with create_codespace(repository=%q, machine_type=..., devcontainer_path=...)", repo))
+
+		return toolSuccess(sb.String()), nil
+	}
 }

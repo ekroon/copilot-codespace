@@ -35,6 +35,7 @@ func NewServer(reg *registry.Registry) *server.MCPServer {
 	s.AddTool(cwdTool(), cwdHandler(reg))
 	s.AddTool(listCodespacesTool(), listCodespacesHandler(reg))
 	s.AddTool(listAvailableCodespacesTool(), listAvailableCodespacesHandler(&RealGHRunner{}))
+	s.AddTool(getCodespaceOptionsTool(), getCodespaceOptionsHandler(&RealGHRunner{}))
 	s.AddTool(createCodespaceTool(), createCodespaceHandler(reg, &RealGHRunner{}))
 	s.AddTool(connectCodespaceTool(), connectCodespaceHandler(reg))
 	s.AddTool(deleteCodespaceTool(), deleteCodespaceHandler(reg, &RealGHRunner{}))
