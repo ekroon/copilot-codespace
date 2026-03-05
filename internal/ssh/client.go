@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Client manages SSH connections to a GitHub Codespace via gh CLI.
@@ -139,20 +141,30 @@ func (c *Client) SetupMultiplexing(ctx context.Context) error {
 		return fmt.Errorf("writing SSH config: %w", err)
 	}
 
-	// Establish master connection in background
-	cmd := exec.CommandContext(ctx, "ssh",
-		"-F", c.sshConfigPath,
-		"-o", "ControlMaster=yes",
-		"-o", "ControlPersist=600",
-		"-fN", // background, no command
-		c.sshHost,
-	)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		// Fall back to non-multiplexed mode
-		fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing failed, using fallback: %v\n", err)
-		c.sshConfigPath = ""
-		return nil
+	// Establish master connection in background (retry once on failure)
+	for attempt := 0; attempt < 2; attempt++ {
+		cmd := exec.CommandContext(ctx, "ssh",
+			"-F", c.sshConfigPath,
+			"-o", "ControlMaster=yes",
+			"-o", "ControlPersist=600",
+			"-fN", // background, no command
+			c.sshHost,
+		)
+		var sshErr bytes.Buffer
+		cmd.Stderr = &sshErr
+		if err := cmd.Run(); err != nil {
+			errDetail := strings.TrimSpace(sshErr.String())
+			if attempt == 0 {
+				fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing attempt 1 failed (%v), retrying...\n", errDetail)
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			// Final attempt failed — fall back to non-multiplexed mode
+			fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing failed, using fallback: %v (%s)\n", err, errDetail)
+			c.sshConfigPath = ""
+			return nil
+		}
+		break
 	}
 
 	fmt.Fprintf(os.Stderr, "codespace-mcp: SSH multiplexing established\n")
@@ -179,9 +191,6 @@ func (c *Client) SSHConfigPath() string {
 
 // Exec runs a command on the codespace and returns stdout, stderr, and exit code.
 func (c *Client) Exec(ctx context.Context, command string) (stdout string, stderr string, exitCode int, err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	// Ensure codespace-injected secrets are available for git auth etc.
 	wrapped := envSecretsLoader + " && " + command
 
@@ -518,6 +527,18 @@ func (c *Client) WriteSession(ctx context.Context, sessionID, input string) erro
 	return nil
 }
 
+// paneDeadRe matches the tmux "Pane is dead" decoration that appears when remain-on-exit is on.
+var paneDeadRe = regexp.MustCompile(`(?m)^Pane is dead.*$`)
+
+// cleanPaneOutput strips tmux decorations (like "Pane is dead") and trailing blank lines
+// from captured pane output so only actual command output is returned.
+func cleanPaneOutput(s string) string {
+	s = paneDeadRe.ReplaceAllString(s, "")
+	// Trim trailing blank lines
+	s = strings.TrimRight(s, "\n ")
+	return s
+}
+
 // ReadSession captures the current tmux pane content (last 100 lines) from the codespace.
 // Works even after the command has exited (thanks to remain-on-exit).
 func (c *Client) ReadSession(ctx context.Context, sessionID string) (string, error) {
@@ -537,6 +558,8 @@ func (c *Client) ReadSession(ctx context.Context, sessionID string) (string, err
 	if exitCode != 0 {
 		return "", fmt.Errorf("read session failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
 	}
+
+	stdout = cleanPaneOutput(stdout)
 
 	// Check if the pane is dead (command exited)
 	statusCmd := fmt.Sprintf("tmux list-panes -t %s -F '#{pane_dead} #{pane_dead_status}' 2>/dev/null", shellQuote(name))
@@ -595,13 +618,7 @@ func (c *Client) ForwardSocket(ctx context.Context, localPath, remotePath string
 	// Cancel any existing forwarding for the same spec. Without this,
 	// ssh -O forward silently succeeds when the ControlMaster already has the
 	// forwarding registered, but does NOT recreate a deleted socket file.
-	cancel := exec.CommandContext(ctx, "ssh",
-		"-F", c.sshConfigPath,
-		"-O", "cancel",
-		"-L", fwdSpec,
-		c.sshHost,
-	)
-	cancel.Run() // ignore error — forwarding may not exist yet
+	c.CancelForward(ctx, localPath, remotePath)
 
 	// Remove stale local socket if it exists
 	if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
@@ -622,6 +639,21 @@ func (c *Client) ForwardSocket(ctx context.Context, localPath, remotePath string
 		return fmt.Errorf("ssh forward: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+// CancelForward cancels an active socket forwarding.
+func (c *Client) CancelForward(ctx context.Context, localPath, remotePath string) {
+	if c.sshConfigPath == "" {
+		return
+	}
+	fwdSpec := localPath + ":" + remotePath
+	cancel := exec.CommandContext(ctx, "ssh",
+		"-F", c.sshConfigPath,
+		"-O", "cancel",
+		"-L", fwdSpec,
+		c.sshHost,
+	)
+	cancel.Run() // ignore error — forwarding may not exist
 }
 
 func pathDir(path string) string {

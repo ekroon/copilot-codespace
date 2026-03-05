@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,7 +37,7 @@ const forwardedLockPrefix = "copilot-codespace-"
 // Stale forwarded lock files from previous runs are cleaned up on startup (by checking
 // if the PID in the lock file is still running). This is necessary because syscall.Exec
 // replaces the process, preventing defer-based cleanup.
-func forwardIDEConnections(sshClient *ssh.Client, codespaceName, localWorkdir string) (int, error) {
+func forwardIDEConnections(sshClient *ssh.Client, codespaceName, localWorkdir, remoteWorkdir string) (int, error) {
 	if sshClient.SSHConfigPath() == "" {
 		return 0, nil // no multiplexing, skip silently
 	}
@@ -77,6 +78,56 @@ func forwardIDEConnections(sshClient *ssh.Client, codespaceName, localWorkdir st
 			continue
 		}
 
+		// Verify the forwarded socket actually works
+		if !probeSocket(localSocket) {
+			fmt.Fprintf(os.Stderr, "  ⚠ IDE socket for %s not responding, retrying...\n", lf.IDEName)
+			// Cancel and retry — the remote IDE may have restarted
+			sshClient.CancelForward(ctx, localSocket, lf.SocketPath)
+			os.Remove(localSocket)
+
+			// Re-fetch lock files to get updated socket paths and auth nonces
+			freshLocks, err := fetchIDELockFiles(sshClient, codespaceName)
+			if err == nil {
+				if freshLF, ok := freshLocks[name]; ok && freshLF.SocketPath != lf.SocketPath {
+					// Remote socket changed — retry with new path
+					if err := sshClient.ForwardSocket(ctx, localSocket, freshLF.SocketPath); err == nil && probeSocket(localSocket) {
+						lf = freshLF
+						fmt.Fprintf(os.Stderr, "  ✓ IDE socket for %s recovered (new remote socket)\n", lf.IDEName)
+					} else {
+						os.Remove(localSocket)
+						fmt.Fprintf(os.Stderr, "  ⚠ IDE %s: retry failed, skipping\n", lf.IDEName)
+						continue
+					}
+				} else {
+					// Same socket path — retry forwarding (tunnel may have been stale)
+					if err := sshClient.ForwardSocket(ctx, localSocket, lf.SocketPath); err == nil && probeSocket(localSocket) {
+						// Use fresh headers (nonce may have changed even if socket path didn't)
+						if freshLF, ok := freshLocks[name]; ok {
+							lf = freshLF
+						}
+						fmt.Fprintf(os.Stderr, "  ✓ IDE socket for %s recovered (re-forwarded)\n", lf.IDEName)
+					} else {
+						os.Remove(localSocket)
+						fmt.Fprintf(os.Stderr, "  ⚠ IDE %s: retry failed, skipping\n", lf.IDEName)
+						continue
+					}
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "  ⚠ IDE %s: could not re-fetch lock files, skipping\n", lf.IDEName)
+				continue
+			}
+		} else {
+			// Socket probe passed — but nonce may still be stale (VS Code restarted
+			// with new nonce but same socket path). Re-fetch to get fresh headers.
+			freshLocks, err := fetchIDELockFiles(sshClient, codespaceName)
+			if err == nil {
+				if freshLF, ok := freshLocks[name]; ok {
+					lf.Headers = freshLF.Headers
+					lf.Timestamp = freshLF.Timestamp
+				}
+			}
+		}
+
 		// Write modified lock file locally
 		localLF := ideLockFile{
 			SocketPath:       localSocket,
@@ -85,7 +136,7 @@ func forwardIDEConnections(sshClient *ssh.Client, codespaceName, localWorkdir st
 			PID:              os.Getpid(), // becomes copilot's PID after syscall.Exec
 			IDEName:          lf.IDEName,
 			Timestamp:        time.Now().UnixMilli(),
-			WorkspaceFolders: []string{localWorkdir},
+			WorkspaceFolders: []string{remoteWorkdir},
 			IsTrusted:        lf.IsTrusted,
 		}
 
@@ -222,4 +273,14 @@ fi
 func shortHash(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return fmt.Sprintf("%x", h[:8])
+}
+
+// probeSocket tests if a Unix socket is accepting connections.
+func probeSocket(path string) bool {
+	conn, err := net.DialTimeout("unix", path, 2*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }

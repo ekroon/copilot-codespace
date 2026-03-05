@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 )
 
 func TestBuildMCPConfig(t *testing.T) {
@@ -154,7 +156,7 @@ func containsHelper(s, substr string) bool {
 func TestCleanMirrorDir(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create some files and directories including .git
+	// Create some files and directories including .git, files/, workspace.json
 	os.MkdirAll(filepath.Join(dir, ".git", "objects"), 0o755)
 	os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("ref"), 0o644)
 	os.MkdirAll(filepath.Join(dir, ".github"), 0o755)
@@ -162,12 +164,17 @@ func TestCleanMirrorDir(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("agents"), 0o644)
 	os.MkdirAll(filepath.Join(dir, "docs"), 0o755)
 	os.WriteFile(filepath.Join(dir, "docs", "AGENTS.md"), []byte("docs agents"), 0o644)
+	os.MkdirAll(filepath.Join(dir, "files"), 0o755)
+	os.WriteFile(filepath.Join(dir, "files", "plan.md"), []byte("my plan"), 0o644)
+	os.WriteFile(filepath.Join(dir, "workspace.json"), []byte("{}"), 0o644)
 
 	cleanMirrorDir(dir)
 
-	// .git should survive
-	if _, err := os.Stat(filepath.Join(dir, ".git", "HEAD")); err != nil {
-		t.Error(".git/HEAD should survive cleanup")
+	// .git, files/, workspace.json should survive
+	for _, name := range []string{".git/HEAD", "files/plan.md", "workspace.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s should survive cleanup", name)
+		}
 	}
 
 	// Everything else should be gone
@@ -440,4 +447,50 @@ func TestRewriteHooksForSSH_InvalidJSON(t *testing.T) {
 	if result != nil {
 		t.Error("expected nil for invalid JSON")
 	}
+}
+
+func TestBuildMCPConfigWithRegistry(t *testing.T) {
+reg := registry.New()
+reg.Register(&registry.ManagedCodespace{
+Alias:      "github",
+Name:       "cs-abc",
+Repository: "github/github",
+Branch:     "main",
+Workdir:    "/workspaces/github",
+})
+
+result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil)
+
+var parsed map[string]any
+if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+t.Fatalf("invalid JSON: %v", err)
+}
+
+servers := parsed["mcpServers"].(map[string]any)
+cs := servers["codespace"].(map[string]any)
+
+if got := cs["command"]; got != "/usr/local/bin/self" {
+t.Errorf("command = %v, want /usr/local/bin/self", got)
+}
+
+env, ok := cs["env"].(map[string]any)
+if !ok {
+t.Fatal("missing env key")
+}
+
+registryJSON, ok := env["CODESPACE_REGISTRY"].(string)
+if !ok || registryJSON == "" {
+t.Fatal("missing CODESPACE_REGISTRY env var")
+}
+
+var entries []registryEntry
+if err := json.Unmarshal([]byte(registryJSON), &entries); err != nil {
+t.Fatalf("invalid CODESPACE_REGISTRY JSON: %v", err)
+}
+if len(entries) != 1 {
+t.Fatalf("got %d entries, want 1", len(entries))
+}
+if entries[0].Alias != "github" {
+t.Errorf("alias = %q, want %q", entries[0].Alias, "github")
+}
 }

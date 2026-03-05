@@ -35,7 +35,9 @@ Single Go binary that operates in three modes, selected by the first argument:
 
 Key packages:
 - `internal/ssh` — `Client` implements `Executor` by running commands over SSH (via `gh codespace ssh` or multiplexed ControlMaster). Async sessions use tmux on the codespace.
-- `internal/shellpatch` — CJS monkey-patch for `--experimental-shell` flag; intercepts Copilot's `!` shell escape and redirects spawn calls over SSH.
+- `internal/registry` — `Registry` maps codespace aliases to `ManagedCodespace` instances, each with its own `ssh.Executor`. Supports multi-codespace sessions.
+- `internal/workspace` — Manages local workspace sessions with `workspace.json` manifests for `--resume` support.
+- `internal/provisioner` — Provisioner interface for custom codespace setup (terminfo upload, git fetch, user-defined hooks).
 
 ## Conventions
 

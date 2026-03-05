@@ -17,8 +17,9 @@ import (
 	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
-	"github.com/ekroon/gh-copilot-codespace/internal/shellpatch"
+	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
+	"github.com/ekroon/gh-copilot-codespace/internal/workspace"
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -32,16 +33,19 @@ type codespace struct {
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: gh copilot-codespace [flags] [-- copilot-args...]
 
-Run Copilot CLI against a remote GitHub Codespace via SSH.
+Run Copilot CLI against remote GitHub Codespace(s) via SSH.
 
 Flags:
-  -c, --codespace NAME   Use a specific codespace (skip interactive picker)
+  -c, --codespace NAME   Use a specific codespace (repeatable, or comma-separated)
   -w, --workdir PATH     Override workspace directory on the codespace
-      --local-shell      Keep shell commands running locally
+      --name SESSION      Name for the local workspace session
+      --resume SESSION    Re-attach to a previous workspace session
+      --local-tools       Keep all local tools (bash, grep, glob) enabled alongside remote_* tools
 
 Subcommands:
   mcp                    Run as MCP server (used internally by Copilot)
-  exec                   Execute a command on the codespace (used internally).
+  exec                   Execute a command on the codespace (used internally)
+  workspaces             List available workspace sessions
 `)
 }
 
@@ -70,6 +74,15 @@ func main() {
 		return
 	}
 
+	// If first arg is "workspaces", list/manage workspace sessions
+	if len(os.Args) > 1 && os.Args[1] == "workspaces" {
+		if err := runWorkspaces(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// Otherwise, run as interactive launcher
 	if err := runLauncher(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -78,49 +91,128 @@ func main() {
 }
 
 func runMCPServer() {
-	codespaceName := os.Getenv("CODESPACE_NAME")
-	if codespaceName == "" {
-		fmt.Fprintln(os.Stderr, "CODESPACE_NAME environment variable is required")
-		os.Exit(1)
+	// Support multi-codespace via CODESPACE_REGISTRY env var (JSON)
+	// Falls back to single CODESPACE_NAME for backward compatibility
+	registryJSON := os.Getenv("CODESPACE_REGISTRY")
+
+	var reg *registry.Registry
+	if registryJSON != "" {
+		var err error
+		reg, err = registryFromJSON(registryJSON)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "codespace-mcp: invalid CODESPACE_REGISTRY: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		codespaceName := os.Getenv("CODESPACE_NAME")
+		if codespaceName == "" {
+			fmt.Fprintln(os.Stderr, "CODESPACE_NAME or CODESPACE_REGISTRY environment variable is required")
+			os.Exit(1)
+		}
+		sshClient := ssh.NewClient(codespaceName)
+		ctx := context.Background()
+		if err := sshClient.SetupMultiplexing(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "codespace-mcp: multiplexing setup warning: %v\n", err)
+		}
+		workdir := os.Getenv("CODESPACE_WORKDIR")
+		reg = registry.New()
+		reg.Register(&registry.ManagedCodespace{
+			Alias:    registry.DefaultAlias(codespaceName, nil),
+			Name:     codespaceName,
+			Workdir:  workdir,
+			Executor: sshClient,
+		})
 	}
 
-	sshClient := ssh.NewClient(codespaceName)
-
-	// Establish SSH multiplexing for fast command execution
-	ctx := context.Background()
-	if err := sshClient.SetupMultiplexing(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "codespace-mcp: multiplexing setup warning: %v\n", err)
-	}
-
-	mcpServer := mcp.NewServer(sshClient, codespaceName)
+	mcpServer := mcp.NewServer(reg)
 
 	log.SetOutput(os.Stderr)
-	log.Printf("codespace-mcp: starting for codespace %q", codespaceName)
+	log.Printf("codespace-mcp: starting with %d codespace(s)", reg.Len())
 
 	if err := server.ServeStdio(mcpServer); err != nil {
 		log.Fatalf("codespace-mcp: server error: %v", err)
 	}
 }
 
+// registryEntry is the JSON-serializable form of a codespace for MCP config env.
+type registryEntry struct {
+	Alias      string `json:"alias"`
+	Name       string `json:"name"`
+	Repository string `json:"repository"`
+	Branch     string `json:"branch"`
+	Workdir    string `json:"workdir"`
+}
+
+// registryFromJSON deserializes CODESPACE_REGISTRY env var and creates SSH clients.
+func registryFromJSON(data string) (*registry.Registry, error) {
+	var entries []registryEntry
+	if err := json.Unmarshal([]byte(data), &entries); err != nil {
+		return nil, fmt.Errorf("parsing registry: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("empty registry")
+	}
+
+	reg := registry.New()
+	ctx := context.Background()
+	for _, e := range entries {
+		sshClient := ssh.NewClient(e.Name)
+		if err := sshClient.SetupMultiplexing(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "codespace-mcp: multiplexing warning for %s: %v\n", e.Alias, err)
+		}
+		if e.Workdir != "" {
+			sshClient.SetWorkdir(e.Workdir)
+		}
+		reg.Register(&registry.ManagedCodespace{
+			Alias:      e.Alias,
+			Name:       e.Name,
+			Repository: e.Repository,
+			Branch:     e.Branch,
+			Workdir:    e.Workdir,
+			Executor:   sshClient,
+		})
+	}
+	return reg, nil
+}
+
 func runLauncher(args []string) error {
 	// Parse our flags (consume them, don't pass to copilot)
-	localShell := false
-	codespaceName := ""
+	var codespaceNames []string
 	workdirOverride := ""
+	sessionName := ""
+	resumeSession := ""
+	localTools := false
 	var copilotArgs []string
 	for i := 0; i < len(args); i++ {
 		switch {
-		case args[i] == "--local-shell":
-			localShell = true
+		case args[i] == "--local-tools":
+			localTools = true
 		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
-			codespaceName = args[i+1]
+			// Support comma-separated: -c cs1,cs2
+			for _, name := range strings.Split(args[i+1], ",") {
+				name = strings.TrimSpace(name)
+				if name != "" {
+					codespaceNames = append(codespaceNames, name)
+				}
+			}
 			i++
 		case (args[i] == "--workdir" || args[i] == "-w") && i+1 < len(args):
 			workdirOverride = args[i+1]
 			i++
+		case args[i] == "--name" && i+1 < len(args):
+			sessionName = args[i+1]
+			i++
+		case args[i] == "--resume" && i+1 < len(args):
+			resumeSession = args[i+1]
+			i++
 		default:
 			copilotArgs = append(copilotArgs, args[i])
 		}
+	}
+
+	// Handle --resume: load workspace and reconnect to codespaces
+	if resumeSession != "" {
+		return runResume(resumeSession, copilotArgs)
 	}
 
 	// The binary serves as both launcher and MCP server
@@ -129,59 +221,102 @@ func runLauncher(args []string) error {
 		return fmt.Errorf("finding executable: %w", err)
 	}
 
-	// Select codespace: use --codespace flag or interactive picker
-	var selected codespace
-	if codespaceName != "" {
-		selected, err = lookupCodespace(codespaceName)
-	} else {
-		selected, err = selectCodespace()
-	}
-	if err != nil {
-		return err
-	}
-	fmt.Printf("Selected: %s (%s)\n", selected.DisplayName, selected.Repository)
-
-	// Start codespace if needed
-	if selected.State != "Available" {
-		if err := startCodespace(selected.Name); err != nil {
-			return err
+	// Select codespace(s): use --codespace flag(s) or interactive picker
+	var selectedList []codespace
+	if len(codespaceNames) > 0 {
+		for _, name := range codespaceNames {
+			cs, err := lookupCodespace(name)
+			if err != nil {
+				return fmt.Errorf("codespace %q: %w", name, err)
+			}
+			selectedList = append(selectedList, cs)
 		}
-	}
-
-	// Detect workspace directory
-	var workdir string
-	if workdirOverride != "" {
-		workdir = workdirOverride
 	} else {
-		workdir, err = detectWorkdir(selected.Name, selected.Repository)
+		selected, err := selectCodespace()
 		if err != nil {
 			return err
 		}
+		selectedList = append(selectedList, selected)
 	}
-	fmt.Printf("Workspace: %s\n", workdir)
 
-	// Set up SSH multiplexing early for fast file fetching (~0.1s vs ~3s per call)
-	sshClient := ssh.NewClient(selected.Name)
 	ctx := context.Background()
-	if err := sshClient.SetupMultiplexing(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: SSH multiplexing failed, fetching will be slower: %v\n", err)
+	reg := registry.New()
+	var firstSSHClient *ssh.Client
+	var firstWorkdir, firstRemoteBinary string
+	var allRemoteMCPServers map[string]any
+
+	for _, selected := range selectedList {
+		fmt.Printf("Selected: %s (%s)\n", selected.DisplayName, selected.Repository)
+
+		// Start codespace if needed
+		if selected.State != "Available" {
+			if err := startCodespace(selected.Name); err != nil {
+				return err
+			}
+		}
+
+		// Detect workspace directory
+		var workdir string
+		if workdirOverride != "" {
+			workdir = workdirOverride
+		} else {
+			workdir, err = detectWorkdir(selected.Name, selected.Repository)
+			if err != nil {
+				return err
+			}
+		}
+		fmt.Printf("  Workspace: %s\n", workdir)
+
+		// Set up SSH multiplexing early for fast file fetching
+		sshClient := ssh.NewClient(selected.Name)
+		if err := sshClient.SetupMultiplexing(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: SSH multiplexing failed for %s: %v\n", selected.Name, err)
+		}
+
+		// Deploy exec agent binary
+		remoteBinary, err := deployBinary(sshClient, selected.Name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not deploy exec agent for %s: %v\n", selected.Name, err)
+		}
+
+		// Detect branch
+		branch := detectRemoteBranch(sshClient, selected.Name, workdir)
+
+		alias := registry.DefaultAlias(selected.Repository, reg.Aliases())
+		sshClient.SetWorkdir(workdir)
+		reg.Register(&registry.ManagedCodespace{
+			Alias:      alias,
+			Name:       selected.Name,
+			Repository: selected.Repository,
+			Branch:     branch,
+			Workdir:    workdir,
+			Executor:   sshClient,
+			ExecAgent:  remoteBinary,
+		})
+
+		if firstSSHClient == nil {
+			firstSSHClient = sshClient
+			firstWorkdir = workdir
+			firstRemoteBinary = remoteBinary
+		}
 	}
 
-	// Deploy exec agent binary to codespace for structured remote execution
-	remoteBinary, err := deployBinary(sshClient, selected.Name)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not deploy exec agent, using shell fallback: %v\n", err)
-	}
+	// Use the first codespace for instruction fetching (primary codespace)
+	primary := selectedList[0]
 
 	// Fetch instruction files into a deterministic dir that acts as the cwd
-	instructionsDir, remoteMCPServers, err := fetchInstructionFiles(sshClient, selected.Name, workdir, remoteBinary)
+	instructionsDir, remoteMCPServers, err := fetchInstructionFiles(firstSSHClient, primary.Name, firstWorkdir, firstRemoteBinary)
 	if err != nil {
 		return fmt.Errorf("fetching instructions: %w", err)
 	}
+	allRemoteMCPServers = remoteMCPServers
 
-	// Prepend codespace context to copilot-instructions.md so the agent knows
-	// how to route between local tools (session state) and remote tools (codespace)
-	writeCodespaceInstructionsPreamble(instructionsDir, workdir)
+	// Prepend codespace context to copilot-instructions.md
+	if reg.Len() > 1 {
+		writeMultiCodespaceInstructionsPreamble(instructionsDir, reg)
+	} else {
+		writeCodespaceInstructionsPreamble(instructionsDir, firstWorkdir)
+	}
 
 	// Ensure the directory is trusted by copilot so it doesn't prompt each time
 	if err := ensureTrustedFolder(instructionsDir); err != nil {
@@ -191,59 +326,68 @@ func runLauncher(args []string) error {
 	// Initialize as git repo so copilot treats it as a repo root and loads instructions
 	exec.Command("git", "-C", instructionsDir, "init", "-q").Run()
 
-	// Set local branch to match the codespace's current branch
-	branch := detectRemoteBranch(sshClient, selected.Name, workdir)
-	if branch != "" {
-		exec.Command("git", "-C", instructionsDir, "symbolic-ref", "HEAD", "refs/heads/"+branch).Run()
+	// Set local branch to match the primary codespace's current branch
+	if all := reg.All(); len(all) > 0 && all[0].Branch != "" {
+		exec.Command("git", "-C", instructionsDir, "symbolic-ref", "HEAD", "refs/heads/"+all[0].Branch).Run()
 	}
 
-	// Generate a postToolUse hook to keep the branch in sync when the agent switches branches
-	generateBranchSyncHook(instructionsDir, selected.Name, workdir, sshClient)
+	// Generate a postToolUse hook to keep the branch in sync
+	generateBranchSyncHook(instructionsDir, primary.Name, firstWorkdir, firstSSHClient)
+
+	// Generate remote-explorer custom agent for codespace file exploration
+	generateRemoteExplorerAgent(instructionsDir)
 
 	// Change to the instructions dir so copilot finds the instruction files
 	if err := os.Chdir(instructionsDir); err != nil {
 		return fmt.Errorf("changing to instructions dir: %w", err)
 	}
 
-	// Build MCP config — points to this same binary with "mcp" subcommand,
-	// plus any MCP servers from the codespace's .copilot/mcp-config.json
-	mcpConfig := buildMCPConfig(self, selected.Name, workdir, remoteMCPServers, remoteBinary)
+	// Build MCP config with registry serialization for multi-CS support
+	mcpConfig := buildMCPConfigWithRegistry(self, reg, allRemoteMCPServers)
 
-	// Excluded tools — local shell/search tools that have remote equivalents.
-	// Keep edit, create, view enabled so the agent can manage local session
-	// state files (plan.md, etc.) while using remote_* for codespace files.
-	excludedTools := []string{
-		"bash", "write_bash", "read_bash",
-		"stop_bash", "list_bash", "grep", "glob",
+	// Excluded tools
+	var excludedTools []string
+	if !localTools {
+		excludedTools = []string{
+			"bash", "write_bash", "read_bash",
+			"stop_bash", "list_bash", "grep", "glob",
+		}
 	}
 
-	// Forward IDE connections from codespace so copilot can auto-connect
-	_, err = forwardIDEConnections(sshClient, selected.Name, instructionsDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: IDE forwarding failed: %v\n", err)
+	// Forward IDE connections from all connected codespaces
+	for _, cs := range reg.All() {
+		if sshClient, ok := cs.Executor.(*ssh.Client); ok && sshClient.SSHConfigPath() != "" {
+			_, err = forwardIDEConnections(sshClient, cs.Name, instructionsDir, cs.Workdir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: IDE forwarding failed for %s: %v\n", cs.Alias, err)
+			}
+		}
+	}
+
+	// Save workspace manifest for --resume
+	ws, wsErr := workspace.New(sessionName)
+	if wsErr == nil {
+		for _, cs := range reg.All() {
+			ws.AddCodespace(cs.Alias, workspace.CodespaceEntry{
+				Name:       cs.Name,
+				Repository: cs.Repository,
+				Branch:     cs.Branch,
+				Workdir:    cs.Workdir,
+			})
+		}
+		ws.Save()
+		fmt.Printf("  Session:   %s (resume with --resume %s)\n", ws.Name, ws.Name)
 	}
 
 	fmt.Printf("\nLaunching Copilot CLI with remote codespace tools...\n")
-	fmt.Printf("  Codespace: %s\n", selected.Name)
-	fmt.Printf("  Workspace: %s\n", workdir)
-	if branch != "" {
-		fmt.Printf("  Branch:    %s\n", branch)
+	for _, cs := range reg.All() {
+		fmt.Printf("  Codespace: %s (alias: %s, repo: %s)\n", cs.Name, cs.Alias, cs.Repository)
 	}
 	fmt.Printf("  Excluded:  %d local tools\n", len(excludedTools))
-	if localShell {
-		fmt.Printf("  Shell:     ! commands execute locally (--local-shell)\n")
-	} else {
-		fmt.Printf("  Shell:     ! commands execute on codespace\n")
-	}
-	fmt.Printf("\n  Shell access (from another terminal):\n")
-	fmt.Printf("    gh codespace ssh -c %s\n\n", selected.Name)
+	fmt.Printf("\n")
 
-	// Exec copilot from the instructions dir (cwd is already set)
-	if localShell {
-		return execCopilot(excludedTools, mcpConfig, copilotArgs)
-	}
-	// Default: use shell patch so "!" commands run on the codespace
-	return execCopilotWithShellPatch(excludedTools, mcpConfig, copilotArgs, sshClient, workdir, instructionsDir)
+	// Exec copilot
+	return execCopilot(excludedTools, mcpConfig, copilotArgs)
 }
 
 // lookupCodespace finds a codespace by name (exact or prefix match).
@@ -608,6 +752,7 @@ You are working on a remote GitHub Codespace. Source code lives on the codespace
 - **Source code** (viewing, editing, creating, searching files in the project): use remote_* tools (remote_view, remote_edit, remote_create, remote_bash, remote_grep, remote_glob)
 - **Local session files** (plan.md, session state, notes under ~/.copilot/): use the built-in local tools (view, edit, create)
 - **Shell commands**: use remote_bash (runs on the codespace), NOT the local bash
+- **Exploring the codebase**: delegate to @remote-explorer instead of the built-in explore agent (the built-in explore agent cannot access remote files)
 
 `, workdir)
 
@@ -628,14 +773,20 @@ You are working on a remote GitHub Codespace. Source code lives on the codespace
 }
 
 // cleanMirrorDir removes all contents of the mirror directory except .git/,
+// files/ (user-created artifacts), and workspace.json (session manifest),
 // ensuring stale instruction files don't persist across fetches.
 func cleanMirrorDir(dir string) {
+	preserve := map[string]bool{
+		".git":           true,
+		"files":          true,
+		"workspace.json": true,
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		if e.Name() == ".git" {
+		if preserve[e.Name()] {
 			continue
 		}
 		os.RemoveAll(filepath.Join(dir, e.Name()))
@@ -711,6 +862,92 @@ func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers 
 	}
 	b, _ := json.Marshal(config)
 	return string(b)
+}
+
+// buildMCPConfigWithRegistry creates the MCP config JSON using the full registry.
+// Uses CODESPACE_REGISTRY env var (JSON array) for multi-codespace support.
+func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remoteMCPServers map[string]any) string {
+	// Serialize registry entries for the MCP server process
+	var entries []registryEntry
+	for _, cs := range reg.All() {
+		entries = append(entries, registryEntry{
+			Alias:      cs.Alias,
+			Name:       cs.Name,
+			Repository: cs.Repository,
+			Branch:     cs.Branch,
+			Workdir:    cs.Workdir,
+		})
+	}
+	registryJSON, _ := json.Marshal(entries)
+
+	servers := map[string]any{
+		"codespace": map[string]any{
+			"type":    "local",
+			"command": selfBinary,
+			"args":    []string{"mcp"},
+			"env": map[string]string{
+				"CODESPACE_REGISTRY": string(registryJSON),
+			},
+			"tools": []string{"*"},
+		},
+	}
+
+	// Merge remote MCP servers using the primary codespace for SSH forwarding
+	if len(reg.All()) > 0 {
+		primary := reg.All()[0]
+		for name, serverConfig := range remoteMCPServers {
+			if name == "codespace" {
+				continue
+			}
+			if server, ok := serverConfig.(map[string]any); ok {
+				rewritten := rewriteMCPServerForSSH(server, primary.Name, primary.Workdir, primary.ExecAgent)
+				if rewritten != nil {
+					servers[name] = rewritten
+				}
+			}
+		}
+	}
+
+	config := map[string]any{
+		"mcpServers": servers,
+	}
+	b, _ := json.Marshal(config)
+	return string(b)
+}
+
+// writeMultiCodespaceInstructionsPreamble writes a preamble listing all connected codespaces.
+func writeMultiCodespaceInstructionsPreamble(mirrorDir string, reg *registry.Registry) {
+	var sb strings.Builder
+	sb.WriteString("# Multi-Codespace Remote Development\n\n")
+	sb.WriteString("You are connected to multiple remote GitHub Codespaces. Source code lives on the codespaces, NOT locally.\n\n")
+	sb.WriteString("## Connected codespaces\n\n")
+	sb.WriteString("| Alias | Repository | Branch | Workdir |\n")
+	sb.WriteString("|-------|-----------|--------|--------|\n")
+	for _, cs := range reg.All() {
+		branch := cs.Branch
+		if branch == "" {
+			branch = "(default)"
+		}
+		sb.WriteString(fmt.Sprintf("| %s | %s | %s | %s |\n", cs.Alias, cs.Repository, branch, cs.Workdir))
+	}
+	sb.WriteString("\n## Tool routing\n\n")
+	sb.WriteString("- **All remote_* tools** accept an optional `codespace` parameter. Use the alias name to target a specific codespace.\n")
+	sb.WriteString("- Use `list_codespaces` to see connected codespaces.\n")
+	sb.WriteString("- **Local session files** (plan.md, session state): use built-in local tools (view, edit, create)\n")
+	sb.WriteString("- **Shell commands**: use `remote_bash` with the `codespace` parameter\n")
+	sb.WriteString("- **Exploring the codebase**: delegate to @remote-explorer instead of the built-in explore agent\n\n")
+
+	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
+		return
+	}
+
+	existing, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		os.WriteFile(instructionsPath, []byte(sb.String()), 0o644)
+		return
+	}
+	os.WriteFile(instructionsPath, []byte(sb.String()+string(existing)), 0o644)
 }
 
 // rewriteMCPServerForSSH rewrites an MCP server config to forward its stdio over SSH.
@@ -957,104 +1194,6 @@ func execCopilot(excludedTools []string, mcpConfig string, extraArgs []string) e
 	return syscall.Exec(ghPath, args, os.Environ())
 }
 
-// execCopilotWithShellPatch runs copilot's JS bundle via node with a require
-// patch that intercepts the "!" shell escape and redirects it over SSH.
-// This bypasses the native binary so the CJS patch can monkey-patch spawn.
-// If the copilot binary is not in PATH (e.g. using gh copilot), falls back
-// to execCopilot with a warning since the shell patch requires index.js.
-func execCopilotWithShellPatch(excludedTools []string, mcpConfig string, extraArgs []string, sshClient *ssh.Client, workdir, mirrorDir string) error {
-	// Find copilot's index.js (the JS bundle) — requires copilot in PATH
-	indexJS, err := findCopilotIndexJS()
-	if err != nil {
-		// Shell patch needs the copilot JS bundle which isn't available via gh copilot.
-		// Fall back to execCopilot (which handles gh copilot fallback).
-		fmt.Fprintf(os.Stderr, "Warning: shell patch unavailable (%v); '!' commands will run locally\n", err)
-		return execCopilot(excludedTools, mcpConfig, extraArgs)
-	}
-
-	// Write the CJS patch to a temp file
-	patchPath, err := shellpatch.WritePatch()
-	if err != nil {
-		return fmt.Errorf("writing shell patch: %w", err)
-	}
-	defer os.RemoveAll(filepath.Dir(patchPath))
-
-	// Find node binary
-	nodePath, err := exec.LookPath("node")
-	if err != nil {
-		return fmt.Errorf("node not found in PATH: %w", err)
-	}
-
-	// Build args: node --require <patch.cjs> <index.js> <copilot-args...>
-	args := []string{"node", "--require", patchPath, indexJS,
-		"--excluded-tools",
-	}
-	args = append(args, excludedTools...)
-	args = append(args, "--additional-mcp-config", mcpConfig)
-	args = append(args, extraArgs...)
-
-	// Add SSH connection info and workdir to env for the patch script
-	env := os.Environ()
-	if sshClient.SSHConfigPath() != "" {
-		env = append(env, "COPILOT_SSH_CONFIG="+sshClient.SSHConfigPath())
-		env = append(env, "COPILOT_SSH_HOST="+sshClient.SSHHost())
-	}
-	env = append(env, "CODESPACE_WORKDIR="+workdir)
-	env = append(env, "CODESPACE_MIRROR_DIR="+mirrorDir)
-
-	// Pre-fetch the auth token from keychain so node doesn't trigger a
-	// macOS keychain prompt (the keychain ACL only trusts the native binary).
-	if token := readCopilotToken(); token != "" {
-		env = append(env, "COPILOT_GITHUB_TOKEN="+token)
-	}
-
-	return syscall.Exec(nodePath, args, env)
-}
-
-// findCopilotIndexJS locates copilot's index.js by following the symlink chain
-// from the `copilot` binary → npm-loader.js → index.js in the same directory.
-func findCopilotIndexJS() (string, error) {
-	copilotPath, err := exec.LookPath("copilot")
-	if err != nil {
-		return "", fmt.Errorf("copilot not found in PATH: %w", err)
-	}
-
-	// Resolve symlinks to get the actual npm-loader.js path
-	realPath, err := filepath.EvalSymlinks(copilotPath)
-	if err != nil {
-		return "", fmt.Errorf("resolving copilot path: %w", err)
-	}
-
-	// index.js is in the same directory as npm-loader.js
-	dir := filepath.Dir(realPath)
-	indexJS := filepath.Join(dir, "index.js")
-
-	if _, err := os.Stat(indexJS); err != nil {
-		return "", fmt.Errorf("copilot index.js not found at %s", indexJS)
-	}
-
-	return indexJS, nil
-}
-
-// readCopilotToken obtains a GitHub token for copilot auth.
-// Uses `gh auth token` to avoid macOS keychain popups (the keychain ACL
-// only trusts the native copilot binary, not node).
-// Returns empty string on any failure.
-func readCopilotToken() string {
-	// Skip if already set via env
-	for _, key := range []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"} {
-		if os.Getenv(key) != "" {
-			return ""
-		}
-	}
-
-	out, err := exec.Command("gh", "auth", "token").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
 // detectRemoteBranch reads the current git branch from the codespace via SSH.
 func detectRemoteBranch(sshClient *ssh.Client, codespaceName, workdir string) string {
 	cmd := fmt.Sprintf("git -C %s rev-parse --abbrev-ref HEAD 2>/dev/null", shellQuote(workdir))
@@ -1104,4 +1243,188 @@ func generateBranchSyncHook(mirrorDir, codespaceName, workdir string, sshClient 
 		return
 	}
 	os.WriteFile(filepath.Join(hooksDir, "branch-sync.json"), data, 0o644)
+}
+
+// generateRemoteExplorerAgent creates a custom agent that can explore codespace
+// files using remote_* MCP tools. This replaces the built-in explore agent which
+// can't access remote tools (its local grep/glob/view are excluded).
+func generateRemoteExplorerAgent(mirrorDir string) {
+	agentsDir := filepath.Join(mirrorDir, ".github", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		return
+	}
+
+	agent := `---
+name: remote-explorer
+description: >-
+  Explore and search codespace files using remote tools. Use this agent instead of the built-in
+  explore agent when you need to search, read, or understand code on a remote codespace.
+  Delegates to this agent are appropriate for: finding files, searching code patterns,
+  understanding codebase structure, reading specific files, and answering questions about code.
+model: claude-haiku-4.5
+tools:
+  - codespace/*
+  - read
+  - search
+---
+
+You are a fast code exploration agent for remote GitHub Codespaces.
+
+## Available tools
+
+Use these remote tools to explore the codespace:
+- **remote_grep** — search for patterns in files (ripgrep)
+- **remote_glob** — find files by name patterns
+- **remote_view** — read file contents with line numbers
+- **remote_bash** — run commands (e.g., find, wc, head, git log)
+- **remote_cwd** — check current working directory
+
+## Guidelines
+
+- Be concise — return focused answers under 300 words
+- Search broadly first, then narrow down
+- Use remote_grep for content search, remote_glob for file discovery
+- Read only the relevant portions of files (use view_range)
+- When exploring structure, use remote_bash with find or ls
+`
+
+	os.WriteFile(filepath.Join(agentsDir, "remote-explorer.agent.md"), []byte(agent), 0o644)
+}
+
+// runResume loads a workspace session and reconnects to its codespaces.
+func runResume(sessionName string, copilotArgs []string) error {
+	ws, err := workspace.Load(sessionName)
+	if err != nil {
+		return fmt.Errorf("loading workspace %q: %w", sessionName, err)
+	}
+
+	if len(ws.Manifest.Codespaces) == 0 {
+		return fmt.Errorf("workspace %q has no codespaces", sessionName)
+	}
+
+	fmt.Printf("Resuming workspace %q...\n", sessionName)
+
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("finding executable: %w", err)
+	}
+
+	ctx := context.Background()
+	reg := registry.New()
+
+	for alias, entry := range ws.Manifest.Codespaces {
+		fmt.Printf("  Reconnecting %s (%s)...\n", alias, entry.Name)
+
+		// Check if codespace still exists and start if needed
+		if err := startCodespace(entry.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠ Codespace %s unavailable: %v (skipping)\n", alias, err)
+			continue
+		}
+
+		sshClient := ssh.NewClient(entry.Name)
+		if err := sshClient.SetupMultiplexing(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠ SSH failed for %s: %v (skipping)\n", alias, err)
+			continue
+		}
+
+		sshClient.SetWorkdir(entry.Workdir)
+		reg.Register(&registry.ManagedCodespace{
+			Alias:      alias,
+			Name:       entry.Name,
+			Repository: entry.Repository,
+			Branch:     entry.Branch,
+			Workdir:    entry.Workdir,
+			Executor:   sshClient,
+		})
+		fmt.Printf("  ✓ %s connected\n", alias)
+	}
+
+	if reg.Len() == 0 {
+		return fmt.Errorf("no codespaces could be reconnected")
+	}
+
+	// Reuse the workspace directory (don't clean it — preserve local files)
+	instructionsDir := ws.Dir
+
+	// Re-fetch instructions (branches may have changed)
+	if all := reg.All(); len(all) > 0 {
+		primary := all[0]
+		remoteBinary, _ := deployBinary(primary.Executor.(*ssh.Client), primary.Name)
+		fetchInstructionFiles(primary.Executor.(*ssh.Client), primary.Name, primary.Workdir, remoteBinary)
+
+		if reg.Len() > 1 {
+			writeMultiCodespaceInstructionsPreamble(instructionsDir, reg)
+		} else {
+			writeCodespaceInstructionsPreamble(instructionsDir, primary.Workdir)
+		}
+	}
+
+	if err := ensureTrustedFolder(instructionsDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not auto-trust directory: %v\n", err)
+	}
+
+	generateRemoteExplorerAgent(instructionsDir)
+
+	if err := os.Chdir(instructionsDir); err != nil {
+		return fmt.Errorf("changing to workspace dir: %w", err)
+	}
+
+	mcpConfig := buildMCPConfigWithRegistry(self, reg, nil)
+
+	excludedTools := []string{
+		"bash", "write_bash", "read_bash",
+		"stop_bash", "list_bash", "grep", "glob",
+	}
+
+	fmt.Printf("\nResuming with %d codespace(s)...\n", reg.Len())
+	for _, cs := range reg.All() {
+		fmt.Printf("  %s: %s (%s)\n", cs.Alias, cs.Name, cs.Repository)
+	}
+	fmt.Printf("\n")
+
+	return execCopilot(excludedTools, mcpConfig, copilotArgs)
+}
+
+// runWorkspaces lists or manages workspace sessions.
+func runWorkspaces(args []string) error {
+	// Parse subcommand args
+	deleteTarget := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--delete" && i+1 < len(args) {
+			deleteTarget = args[i+1]
+			i++
+		}
+	}
+
+	if deleteTarget != "" {
+		dir := workspace.WorkspacePath(deleteTarget)
+		if _, err := os.Stat(dir); err != nil {
+			return fmt.Errorf("workspace %q not found", deleteTarget)
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("deleting workspace: %w", err)
+		}
+		fmt.Printf("Deleted workspace %q\n", deleteTarget)
+		return nil
+	}
+
+	// List workspaces
+	list, err := workspace.List()
+	if err != nil {
+		return err
+	}
+
+	if len(list) == 0 {
+		fmt.Println("No workspace sessions found.")
+		return nil
+	}
+
+	fmt.Printf("%-30s %-20s %s\n", "Name", "Created", "Codespaces")
+	fmt.Println(strings.Repeat("-", 60))
+	for _, ws := range list {
+		fmt.Printf("%-30s %-20s %d\n", ws.Name, ws.Created.Format("2006-01-02 15:04"), ws.CodespaceCount)
+	}
+	fmt.Printf("\nResume with: gh copilot-codespace --resume <name>\n")
+	fmt.Printf("Delete with: gh copilot-codespace workspaces --delete <name>\n")
+	return nil
 }

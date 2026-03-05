@@ -2,36 +2,81 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
 // NewServer creates and configures the MCP server with all remote tools.
-func NewServer(sshClient ssh.Executor, codespaceName string) *server.MCPServer {
-	s := server.NewMCPServer("codespace-mcp", "0.1.0")
+// Uses a registry to support multiple codespaces.
+func NewServer(reg *registry.Registry, lcfg ...LifecycleConfig) *server.MCPServer {
+	s := server.NewMCPServer("codespace-mcp", "0.2.0")
 
-	s.AddTool(viewTool(), viewHandler(sshClient))
-	s.AddTool(editTool(), editHandler(sshClient))
-	s.AddTool(createTool(), createHandler(sshClient))
-	s.AddTool(bashTool(), bashHandler(sshClient))
-	s.AddTool(grepTool(), grepHandler(sshClient))
-	s.AddTool(globTool(), globHandler(sshClient))
-	s.AddTool(writeBashTool(), writeBashHandler(sshClient))
-	s.AddTool(readBashTool(), readBashHandler(sshClient))
-	s.AddTool(stopBashTool(), stopBashHandler(sshClient))
-	s.AddTool(listBashTool(), listBashHandler(sshClient))
-	s.AddTool(openShellTool(), openShellHandler(codespaceName))
-	s.AddTool(cdTool(), cdHandler(sshClient))
-	s.AddTool(cwdTool(), cwdHandler(sshClient))
+	// Default lifecycle config
+	var cfg LifecycleConfig
+	if len(lcfg) > 0 {
+		cfg = lcfg[0]
+	}
+	if cfg.GHRunner == nil {
+		cfg.GHRunner = &RealGHRunner{}
+	}
+
+	s.AddTool(viewTool(), viewHandler(reg))
+	s.AddTool(editTool(), editHandler(reg))
+	s.AddTool(createTool(), createHandler(reg))
+	s.AddTool(bashTool(), bashHandler(reg))
+	s.AddTool(grepTool(), grepHandler(reg))
+	s.AddTool(globTool(), globHandler(reg))
+	s.AddTool(writeBashTool(), writeBashHandler(reg))
+	s.AddTool(readBashTool(), readBashHandler(reg))
+	s.AddTool(stopBashTool(), stopBashHandler(reg))
+	s.AddTool(listBashTool(), listBashHandler(reg))
+	s.AddTool(openShellTool(), openShellHandler(reg))
+	s.AddTool(cdTool(), cdHandler(reg))
+	s.AddTool(cwdTool(), cwdHandler(reg))
+	s.AddTool(listCodespacesTool(), listCodespacesHandler(reg))
+	s.AddTool(listAvailableCodespacesTool(), listAvailableCodespacesHandler(cfg.GHRunner))
+	s.AddTool(getCodespaceOptionsTool(), getCodespaceOptionsHandler(cfg.GHRunner))
+	s.AddTool(createCodespaceTool(), createCodespaceHandler(reg, cfg))
+	s.AddTool(connectCodespaceTool(), connectCodespaceHandler(reg, cfg))
+	s.AddTool(deleteCodespaceTool(), deleteCodespaceHandler(reg, cfg.GHRunner))
 
 	return s
+}
+
+// NewServerSingle creates an MCP server with a single codespace for backward compatibility.
+func NewServerSingle(executor ssh.Executor, codespaceName string) *server.MCPServer {
+	reg := registry.New()
+	reg.Register(&registry.ManagedCodespace{
+		Alias:    registry.DefaultAlias(codespaceName, nil),
+		Name:     codespaceName,
+		Executor: executor,
+	})
+	return NewServer(reg)
+}
+
+// resolveExecutor extracts the codespace alias from the request and resolves it via the registry.
+func resolveExecutor(reg *registry.Registry, req mcpsdk.CallToolRequest) (ssh.Executor, error) {
+	alias := optionalString(req, "codespace")
+	cs, err := reg.Resolve(alias)
+	if err != nil {
+		return nil, err
+	}
+	return cs.Executor, nil
+}
+
+// codespaceParam is the common "codespace" parameter added to all remote tools.
+var codespaceParam = map[string]any{
+	"type":        "string",
+	"description": "Codespace alias (optional if only one connected). Use list_codespaces to see available aliases.",
 }
 
 // --- remote_view ---
@@ -43,6 +88,7 @@ func viewTool() mcpsdk.Tool {
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
+				"codespace": codespaceParam,
 				"path": map[string]any{
 					"type":        "string",
 					"description": "Path to the file to view",
@@ -58,8 +104,12 @@ func viewTool() mcpsdk.Tool {
 	}
 }
 
-func viewHandler(c ssh.Executor) server.ToolHandlerFunc {
+func viewHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		path, err := requiredString(req, "path")
 		if err != nil {
 			return toolError(err.Error()), nil
@@ -93,6 +143,7 @@ func editTool() mcpsdk.Tool {
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
+				"codespace": codespaceParam,
 				"path": map[string]any{
 					"type":        "string",
 					"description": "Path to the file to edit",
@@ -111,8 +162,12 @@ func editTool() mcpsdk.Tool {
 	}
 }
 
-func editHandler(c ssh.Executor) server.ToolHandlerFunc {
+func editHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		path, err := requiredString(req, "path")
 		if err != nil {
 			return toolError(err.Error()), nil
@@ -142,6 +197,7 @@ func createTool() mcpsdk.Tool {
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
+				"codespace": codespaceParam,
 				"path": map[string]any{
 					"type":        "string",
 					"description": "Path for the new file",
@@ -156,8 +212,12 @@ func createTool() mcpsdk.Tool {
 	}
 }
 
-func createHandler(c ssh.Executor) server.ToolHandlerFunc {
+func createHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		path, err := requiredString(req, "path")
 		if err != nil {
 			return toolError(err.Error()), nil
@@ -179,10 +239,11 @@ func createHandler(c ssh.Executor) server.ToolHandlerFunc {
 func bashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_bash",
-		Description: "Execute a bash command on the remote codespace. Use mode 'async' for long-running or interactive commands (returns a shellId for use with remote_write_bash/remote_read_bash). Replaces the local 'bash' tool.",
+		Description: "Execute a bash command on the remote codespace. In sync mode (default), waits for completion. Use 'initial_wait' for commands that may take time — it will wait up to that many seconds, then return partial output and a shellId for continued reading with remote_read_bash. Use mode 'async' for interactive or very long-running commands. Replaces the local 'bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
+				"codespace": codespaceParam,
 				"command": map[string]any{
 					"type":        "string",
 					"description": "The bash command to execute",
@@ -196,6 +257,10 @@ func bashTool() mcpsdk.Tool {
 					"description": "Execution mode: 'sync' (default) waits for completion, 'async' runs in background and returns a shellId",
 					"enum":        []string{"sync", "async"},
 				},
+				"initial_wait": map[string]any{
+					"type":        "number",
+					"description": "Seconds to wait for initial output in sync mode (default: 30). If the command hasn't completed, returns partial output and a shellId for follow-up reads with remote_read_bash. Give long-running commands adequate time (e.g., 120+ for builds/tests).",
+				},
 				"shellId": map[string]any{
 					"type":        "string",
 					"description": "Session identifier for async mode. Auto-generated if not provided.",
@@ -206,14 +271,20 @@ func bashTool() mcpsdk.Tool {
 	}
 }
 
-func bashHandler(c ssh.Executor) server.ToolHandlerFunc {
+func bashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		command, err := requiredString(req, "command")
 		if err != nil {
 			return toolError(err.Error()), nil
 		}
 
 		mode := optionalString(req, "mode")
+		initialWait := optionalFloat(req, "initial_wait", 0)
+
 		if mode == "async" {
 			shellId := optionalString(req, "shellId")
 			if shellId == "" {
@@ -228,9 +299,25 @@ func bashHandler(c ssh.Executor) server.ToolHandlerFunc {
 			return toolSuccess(fmt.Sprintf("Started async session: %s\n\n%s", shellId, output)), nil
 		}
 
+		// Sync mode with initial_wait: start as async, wait, return partial output
+		if initialWait > 0 {
+			shellId := fmt.Sprintf("sh-%d", time.Now().UnixMilli())
+			if err := c.StartSession(ctx, shellId, command); err != nil {
+				return toolError(err.Error()), nil
+			}
+			time.Sleep(time.Duration(initialWait * float64(time.Second)))
+			output, _ := c.ReadSession(ctx, shellId)
+			return toolSuccess(fmt.Sprintf("%s\n\n[shellId: %s — use remote_read_bash to check for more output]", output, shellId)), nil
+		}
+
+		// Pure sync: run and wait for completion
 		stdout, stderr, exitCode, err := c.RunBash(ctx, command)
 		if err != nil {
-			return toolError(err.Error()), nil
+			errMsg := err.Error()
+			if ctx.Err() != nil {
+				errMsg += "\n\nHint: This command may have timed out. Use initial_wait parameter (e.g., initial_wait=60) or mode='async' for long-running commands."
+			}
+			return toolError(errMsg), nil
 		}
 
 		var result strings.Builder
@@ -261,6 +348,7 @@ func writeBashTool() mcpsdk.Tool {
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
+				"codespace": codespaceParam,
 				"shellId": map[string]any{
 					"type":        "string",
 					"description": "The session ID returned by remote_bash in async mode",
@@ -279,8 +367,12 @@ func writeBashTool() mcpsdk.Tool {
 	}
 }
 
-func writeBashHandler(c ssh.Executor) server.ToolHandlerFunc {
+func writeBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		shellId, err := requiredString(req, "shellId")
 		if err != nil {
 			return toolError(err.Error()), nil
@@ -309,17 +401,18 @@ func writeBashHandler(c ssh.Executor) server.ToolHandlerFunc {
 func readBashTool() mcpsdk.Tool {
 	return mcpsdk.Tool{
 		Name:        "remote_read_bash",
-		Description: "Read output from an async bash session on the remote codespace. Replaces the local 'read_bash' tool.",
+		Description: "Read output from an async bash session on the remote codespace. Returns the last 100 lines of the session's terminal output. If a command hasn't completed, call again with a longer delay. Use exponential backoff between reads to minimize overhead. Replaces the local 'read_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
+				"codespace": codespaceParam,
 				"shellId": map[string]any{
 					"type":        "string",
-					"description": "The session ID returned by remote_bash in async mode",
+					"description": "The session ID returned by remote_bash in async mode or with initial_wait",
 				},
 				"delay": map[string]any{
 					"type":        "number",
-					"description": "Seconds to wait before reading output (default: 2)",
+					"description": "Seconds to wait before reading output (default: 2). Use longer delays for slow commands to avoid unnecessary reads.",
 				},
 			},
 			Required: []string{"shellId"},
@@ -327,8 +420,12 @@ func readBashTool() mcpsdk.Tool {
 	}
 }
 
-func readBashHandler(c ssh.Executor) server.ToolHandlerFunc {
+func readBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		shellId, err := requiredString(req, "shellId")
 		if err != nil {
 			return toolError(err.Error()), nil
@@ -354,6 +451,7 @@ func stopBashTool() mcpsdk.Tool {
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
+				"codespace": codespaceParam,
 				"shellId": map[string]any{
 					"type":        "string",
 					"description": "The session ID to stop",
@@ -364,8 +462,12 @@ func stopBashTool() mcpsdk.Tool {
 	}
 }
 
-func stopBashHandler(c ssh.Executor) server.ToolHandlerFunc {
+func stopBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		shellId, err := requiredString(req, "shellId")
 		if err != nil {
 			return toolError(err.Error()), nil
@@ -386,13 +488,19 @@ func listBashTool() mcpsdk.Tool {
 		Description: "List active async bash sessions on the remote codespace. Replaces the local 'list_bash' tool.",
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
-			Properties: map[string]any{},
+			Properties: map[string]any{
+				"codespace": codespaceParam,
+			},
 		},
 	}
 }
 
-func listBashHandler(c ssh.Executor) server.ToolHandlerFunc {
+func listBashHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		result, err := c.ListSessions(ctx)
 		if err != nil {
 			return toolError(err.Error()), nil
@@ -413,6 +521,7 @@ func grepTool() mcpsdk.Tool {
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
+				"codespace": codespaceParam,
 				"pattern": map[string]any{
 					"type":        "string",
 					"description": "The regex pattern to search for",
@@ -431,8 +540,12 @@ func grepTool() mcpsdk.Tool {
 	}
 }
 
-func grepHandler(c ssh.Executor) server.ToolHandlerFunc {
+func grepHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		pattern, err := requiredString(req, "pattern")
 		if err != nil {
 			return toolError(err.Error()), nil
@@ -461,6 +574,7 @@ func globTool() mcpsdk.Tool {
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
+				"codespace": codespaceParam,
 				"pattern": map[string]any{
 					"type":        "string",
 					"description": "The glob pattern to match files against (e.g., '*.go', '**/*.ts')",
@@ -475,8 +589,12 @@ func globTool() mcpsdk.Tool {
 	}
 }
 
-func globHandler(c ssh.Executor) server.ToolHandlerFunc {
+func globHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		pattern, err := requiredString(req, "pattern")
 		if err != nil {
 			return toolError(err.Error()), nil
@@ -575,6 +693,7 @@ func cdTool() mcpsdk.Tool {
 		InputSchema: mcpsdk.ToolInputSchema{
 			Type: "object",
 			Properties: map[string]any{
+				"codespace": codespaceParam,
 				"path": map[string]any{
 					"type":        "string",
 					"description": "The directory path to change to on the codespace",
@@ -585,8 +704,12 @@ func cdTool() mcpsdk.Tool {
 	}
 }
 
-func cdHandler(c ssh.Executor) server.ToolHandlerFunc {
+func cdHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		path, err := requiredString(req, "path")
 		if err != nil {
 			return toolError(err.Error()), nil
@@ -618,14 +741,20 @@ func cwdTool() mcpsdk.Tool {
 		Name:        "remote_cwd",
 		Description: "Get the current working directory on the remote codespace.",
 		InputSchema: mcpsdk.ToolInputSchema{
-			Type:       "object",
-			Properties: map[string]any{},
+			Type: "object",
+			Properties: map[string]any{
+				"codespace": codespaceParam,
+			},
 		},
 	}
 }
 
-func cwdHandler(c ssh.Executor) server.ToolHandlerFunc {
+func cwdHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		c, err := resolveExecutor(reg, req)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
 		return toolSuccess(c.GetWorkdir()), nil
 	}
 }
@@ -637,14 +766,23 @@ func openShellTool() mcpsdk.Tool {
 		Name:        "open_shell",
 		Description: "Open an interactive SSH shell to the codespace in a new terminal tab/window. Use this when the user asks for a shell, terminal, or SSH access to the codespace.",
 		InputSchema: mcpsdk.ToolInputSchema{
-			Type:       "object",
-			Properties: map[string]any{},
+			Type: "object",
+			Properties: map[string]any{
+				"codespace": codespaceParam,
+			},
 		},
 	}
 }
 
-func openShellHandler(codespaceName string) server.ToolHandlerFunc {
+func openShellHandler(reg *registry.Registry) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		alias := optionalString(req, "codespace")
+		cs, err := reg.Resolve(alias)
+		if err != nil {
+			return toolError(err.Error()), nil
+		}
+		codespaceName := cs.Name
+
 		sshCmd := fmt.Sprintf("gh codespace ssh -c %s", codespaceName)
 
 		if err := openTerminalTab(sshCmd, "codespace: "+codespaceName); err != nil {
@@ -758,4 +896,85 @@ func openITerm2Tab(command string) error {
 	end tell
 end tell`, escaped)
 	return exec.Command("osascript", "-e", script).Run()
+}
+
+// --- list_codespaces ---
+
+func listCodespacesTool() mcpsdk.Tool {
+	return mcpsdk.Tool{
+		Name:        "list_codespaces",
+		Description: "List codespaces that are currently connected in this session, with their aliases, repositories, branches, and working directories.",
+		InputSchema: mcpsdk.ToolInputSchema{
+			Type:       "object",
+			Properties: map[string]any{},
+		},
+	}
+}
+
+func listCodespacesHandler(reg *registry.Registry) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		all := reg.All()
+		if len(all) == 0 {
+			return toolSuccess("No codespaces connected. Use list_available_codespaces to see codespaces you can connect to."), nil
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("%-12s %-30s %-20s %s\n", "Alias", "Repository", "Branch", "Workdir"))
+		sb.WriteString(strings.Repeat("-", 80) + "\n")
+		for _, cs := range all {
+			branch := cs.Branch
+			if branch == "" {
+				branch = "(unknown)"
+			}
+			sb.WriteString(fmt.Sprintf("%-12s %-30s %-20s %s\n", cs.Alias, cs.Repository, branch, cs.Workdir))
+		}
+		return toolSuccess(sb.String()), nil
+	}
+}
+
+// --- list_available_codespaces ---
+
+func listAvailableCodespacesTool() mcpsdk.Tool {
+	return mcpsdk.Tool{
+		Name:        "list_available_codespaces",
+		Description: "List all GitHub Codespaces available to connect to (runs gh codespace list locally). Use this to discover codespaces before connecting with connect_codespace.",
+		InputSchema: mcpsdk.ToolInputSchema{
+			Type:       "object",
+			Properties: map[string]any{},
+		},
+	}
+}
+
+func listAvailableCodespacesHandler(ghRunner GHRunner) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		output, err := ghRunner.Run(ctx, "codespace", "list",
+			"--json", "name,displayName,repository,state",
+			"--limit", "50")
+		if err != nil {
+			return toolError(fmt.Sprintf("failed to list codespaces: %v", err)), nil
+		}
+
+		var codespaces []struct {
+			Name        string `json:"name"`
+			DisplayName string `json:"displayName"`
+			Repository  string `json:"repository"`
+			State       string `json:"state"`
+		}
+		if err := json.Unmarshal([]byte(output), &codespaces); err != nil {
+			return toolError(fmt.Sprintf("parsing codespace list: %v", err)), nil
+		}
+
+		if len(codespaces) == 0 {
+			return toolSuccess("No codespaces found. Use create_codespace to create one."), nil
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("%-45s %-30s %-12s %s\n", "Name", "Repository", "State", "Display Name"))
+		sb.WriteString(strings.Repeat("-", 100) + "\n")
+		for _, cs := range codespaces {
+			sb.WriteString(fmt.Sprintf("%-45s %-30s %-12s %s\n", cs.Name, cs.Repository, cs.State, cs.DisplayName))
+		}
+		sb.WriteString("\nConnect with: connect_codespace(name=\"<codespace-name>\")")
+		return toolSuccess(sb.String()), nil
+	}
 }
