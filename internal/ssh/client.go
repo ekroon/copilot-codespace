@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -526,6 +527,18 @@ func (c *Client) WriteSession(ctx context.Context, sessionID, input string) erro
 	return nil
 }
 
+// paneDeadRe matches the tmux "Pane is dead" decoration that appears when remain-on-exit is on.
+var paneDeadRe = regexp.MustCompile(`(?m)^Pane is dead.*$`)
+
+// cleanPaneOutput strips tmux decorations (like "Pane is dead") and trailing blank lines
+// from captured pane output so only actual command output is returned.
+func cleanPaneOutput(s string) string {
+	s = paneDeadRe.ReplaceAllString(s, "")
+	// Trim trailing blank lines
+	s = strings.TrimRight(s, "\n ")
+	return s
+}
+
 // ReadSession captures the current tmux pane content (last 100 lines) from the codespace.
 // Works even after the command has exited (thanks to remain-on-exit).
 func (c *Client) ReadSession(ctx context.Context, sessionID string) (string, error) {
@@ -545,6 +558,8 @@ func (c *Client) ReadSession(ctx context.Context, sessionID string) (string, err
 	if exitCode != 0 {
 		return "", fmt.Errorf("read session failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
 	}
+
+	stdout = cleanPaneOutput(stdout)
 
 	// Check if the pane is dead (command exited)
 	statusCmd := fmt.Sprintf("tmux list-panes -t %s -F '#{pane_dead} #{pane_dead_status}' 2>/dev/null", shellQuote(name))

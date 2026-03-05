@@ -94,6 +94,52 @@ func TestTmuxSessionName(t *testing.T) {
 	}
 }
 
+func TestCleanPaneOutput(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			"strips pane is dead line",
+			"hello world\nPane is dead (status 0, Thu Mar  5 08:17:27 2026)\n",
+			"hello world",
+		},
+		{
+			"strips pane is dead with non-zero status",
+			"some output\nPane is dead (status 1, Thu Mar  5 09:00:00 2026)\n\n",
+			"some output",
+		},
+		{
+			"no pane is dead line",
+			"just output\nmore output\n",
+			"just output\nmore output",
+		},
+		{
+			"trims trailing blank lines",
+			"output\n\n\n\n",
+			"output",
+		},
+		{
+			"empty output",
+			"\n\n",
+			"",
+		},
+		{
+			"pane is dead only",
+			"Pane is dead (status 0, Thu Mar  5 08:17:27 2026)\n",
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cleanPaneOutput(tt.input); got != tt.want {
+				t.Errorf("cleanPaneOutput() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSetGetWorkdir(t *testing.T) {
 c := NewClient("test-codespace")
 
