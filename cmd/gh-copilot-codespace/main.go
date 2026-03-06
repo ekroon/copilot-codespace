@@ -116,12 +116,15 @@ func runMCPServer() {
 		}
 		workdir := os.Getenv("CODESPACE_WORKDIR")
 		reg = registry.New()
-		reg.Register(&registry.ManagedCodespace{
+		if err := reg.Register(&registry.ManagedCodespace{
 			Alias:    registry.DefaultAlias(codespaceName, nil),
 			Name:     codespaceName,
 			Workdir:  workdir,
 			Executor: sshClient,
-		})
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "codespace-mcp: invalid single-codespace registry: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	mcpServer := mcp.NewServer(reg)
@@ -149,13 +152,7 @@ func registryFromJSON(data string) (*registry.Registry, error) {
 	if err := json.Unmarshal([]byte(data), &entries); err != nil {
 		return nil, fmt.Errorf("parsing registry: %w", err)
 	}
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("empty registry")
-	}
-
-	reg := registry.New()
-	ctx := context.Background()
-	for _, e := range entries {
+	return registryFromEntries(context.Background(), entries, func(ctx context.Context, e registryEntry) (*registry.ManagedCodespace, error) {
 		sshClient := ssh.NewClient(e.Name)
 		if err := sshClient.SetupMultiplexing(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "codespace-mcp: multiplexing warning for %s: %v\n", e.Alias, err)
@@ -163,14 +160,31 @@ func registryFromJSON(data string) (*registry.Registry, error) {
 		if e.Workdir != "" {
 			sshClient.SetWorkdir(e.Workdir)
 		}
-		reg.Register(&registry.ManagedCodespace{
+		return &registry.ManagedCodespace{
 			Alias:      e.Alias,
 			Name:       e.Name,
 			Repository: e.Repository,
 			Branch:     e.Branch,
 			Workdir:    e.Workdir,
 			Executor:   sshClient,
-		})
+		}, nil
+	})
+}
+
+func registryFromEntries(ctx context.Context, entries []registryEntry, build func(context.Context, registryEntry) (*registry.ManagedCodespace, error)) (*registry.Registry, error) {
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("empty registry")
+	}
+
+	reg := registry.New()
+	for _, e := range entries {
+		cs, err := build(ctx, e)
+		if err != nil {
+			return nil, fmt.Errorf("building registry entry %q: %w", e.Alias, err)
+		}
+		if err := reg.Register(cs); err != nil {
+			return nil, fmt.Errorf("registering registry entry %q: %w", e.Alias, err)
+		}
 	}
 	return reg, nil
 }
@@ -284,7 +298,7 @@ func runLauncher(args []string) error {
 
 		alias := registry.DefaultAlias(selected.Repository, reg.Aliases())
 		sshClient.SetWorkdir(workdir)
-		reg.Register(&registry.ManagedCodespace{
+		if err := reg.Register(&registry.ManagedCodespace{
 			Alias:      alias,
 			Name:       selected.Name,
 			Repository: selected.Repository,
@@ -292,7 +306,9 @@ func runLauncher(args []string) error {
 			Workdir:    workdir,
 			Executor:   sshClient,
 			ExecAgent:  remoteBinary,
-		})
+		}); err != nil {
+			return fmt.Errorf("registering selected codespace %q: %w", selected.Name, err)
+		}
 
 		if firstSSHClient == nil {
 			firstSSHClient = sshClient
@@ -633,9 +649,9 @@ echo "$SEP"
 	// MCP config locations to parse (not written to mirror)
 	mcpConfigPaths := map[string]bool{
 		".copilot/mcp-config.json": true,
-		".vscode/mcp.json":        true,
-		".mcp.json":               true,
-		".github/mcp.json":        true,
+		".vscode/mcp.json":         true,
+		".mcp.json":                true,
+		".github/mcp.json":         true,
 	}
 
 	for relPath, content := range files {
@@ -1328,14 +1344,16 @@ func runResume(sessionName string, copilotArgs []string) error {
 		}
 
 		sshClient.SetWorkdir(entry.Workdir)
-		reg.Register(&registry.ManagedCodespace{
+		if err := reg.Register(&registry.ManagedCodespace{
 			Alias:      alias,
 			Name:       entry.Name,
 			Repository: entry.Repository,
 			Branch:     entry.Branch,
 			Workdir:    entry.Workdir,
 			Executor:   sshClient,
-		})
+		}); err != nil {
+			return fmt.Errorf("registering resumed codespace %q: %w", entry.Name, err)
+		}
 		fmt.Printf("  ✓ %s connected\n", alias)
 	}
 

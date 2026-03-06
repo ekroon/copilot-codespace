@@ -12,8 +12,8 @@ import (
 // ManagedCodespace represents a connected codespace with its SSH client and metadata.
 type ManagedCodespace struct {
 	Alias      string
-	Name       string       // gh codespace name (e.g., "fluffy-spoon-abc123")
-	Repository string       // e.g., "github/github"
+	Name       string // gh codespace name (e.g., "fluffy-spoon-abc123")
+	Repository string // e.g., "github/github"
 	Branch     string
 	Workdir    string       // detected workspace directory on the codespace
 	Executor   ssh.Executor // SSH client for this codespace
@@ -40,6 +40,9 @@ func (r *Registry) Register(cs *ManagedCodespace) error {
 
 	if _, exists := r.codespaces[cs.Alias]; exists {
 		return fmt.Errorf("alias %q already registered", cs.Alias)
+	}
+	if existing := r.findByNameLocked(cs.Name); existing != nil {
+		return fmt.Errorf("codespace %q already connected as alias %q", cs.Name, existing.Alias)
 	}
 	r.codespaces[cs.Alias] = cs
 	return nil
@@ -93,6 +96,25 @@ func (r *Registry) aliasesLocked() []string {
 	}
 	sort.Strings(aliases)
 	return aliases
+}
+
+// FindByName returns the registered codespace with the given codespace name.
+func (r *Registry) FindByName(name string) *ManagedCodespace {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.findByNameLocked(name)
+}
+
+func (r *Registry) findByNameLocked(name string) *ManagedCodespace {
+	if name == "" {
+		return nil
+	}
+	for _, cs := range r.codespaces {
+		if cs.Name == name {
+			return cs
+		}
+	}
+	return nil
 }
 
 // All returns all registered codespaces (sorted by alias).

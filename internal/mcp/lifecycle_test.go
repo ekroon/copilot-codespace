@@ -162,6 +162,30 @@ func TestConnectCodespaceHandler_MissingName(t *testing.T) {
 	}
 }
 
+func TestConnectCodespaceHandler_DuplicateCodespaceName(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	reg := registry.New()
+	if err := reg.Register(&registry.ManagedCodespace{
+		Alias:    "graph-hopper",
+		Name:     "graph-hopper-pre-prod-97pxr4rj4cpg79",
+		Executor: &mockExecutor{},
+	}); err != nil {
+		t.Fatalf("register existing codespace: %v", err)
+	}
+
+	handler := connectCodespaceHandler(reg, LifecycleConfig{})
+	res, _ := handler(context.Background(), makeReq(map[string]any{
+		"name": "graph-hopper-pre-prod-97pxr4rj4cpg79",
+	}))
+	if !res.IsError {
+		t.Fatal("expected duplicate codespace error")
+	}
+	if !strings.Contains(resultText(res), `already connected as alias "graph-hopper"`) {
+		t.Fatalf("expected existing alias in error, got %q", resultText(res))
+	}
+}
+
 // Helper for lifecycle tests
 func makeLifecycleReq(args map[string]any) mcpsdk.CallToolRequest {
 	return mcpsdk.CallToolRequest{

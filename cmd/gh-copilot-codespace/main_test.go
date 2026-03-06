@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
@@ -450,47 +452,78 @@ func TestRewriteHooksForSSH_InvalidJSON(t *testing.T) {
 }
 
 func TestBuildMCPConfigWithRegistry(t *testing.T) {
-reg := registry.New()
-reg.Register(&registry.ManagedCodespace{
-Alias:      "github",
-Name:       "cs-abc",
-Repository: "github/github",
-Branch:     "main",
-Workdir:    "/workspaces/github",
-})
+	reg := registry.New()
+	reg.Register(&registry.ManagedCodespace{
+		Alias:      "github",
+		Name:       "cs-abc",
+		Repository: "github/github",
+		Branch:     "main",
+		Workdir:    "/workspaces/github",
+	})
 
-result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil)
+	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil)
 
-var parsed map[string]any
-if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-t.Fatalf("invalid JSON: %v", err)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	servers := parsed["mcpServers"].(map[string]any)
+	cs := servers["codespace"].(map[string]any)
+
+	if got := cs["command"]; got != "/usr/local/bin/self" {
+		t.Errorf("command = %v, want /usr/local/bin/self", got)
+	}
+
+	env, ok := cs["env"].(map[string]any)
+	if !ok {
+		t.Fatal("missing env key")
+	}
+
+	registryJSON, ok := env["CODESPACE_REGISTRY"].(string)
+	if !ok || registryJSON == "" {
+		t.Fatal("missing CODESPACE_REGISTRY env var")
+	}
+
+	var entries []registryEntry
+	if err := json.Unmarshal([]byte(registryJSON), &entries); err != nil {
+		t.Fatalf("invalid CODESPACE_REGISTRY JSON: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(entries))
+	}
+	if entries[0].Alias != "github" {
+		t.Errorf("alias = %q, want %q", entries[0].Alias, "github")
+	}
 }
 
-servers := parsed["mcpServers"].(map[string]any)
-cs := servers["codespace"].(map[string]any)
+func TestRegistryFromEntries_DuplicateCodespaceName(t *testing.T) {
+	entries := []registryEntry{
+		{
+			Alias:      "graph-hopper",
+			Name:       "graph-hopper-pre-prod-97pxr4rj4cpg79",
+			Repository: "acme/graph-hopper",
+		},
+		{
+			Alias:      "graph-hopper-pre-prod-97pxr4rj4cpg79",
+			Name:       "graph-hopper-pre-prod-97pxr4rj4cpg79",
+			Repository: "acme/graph-hopper",
+		},
+	}
 
-if got := cs["command"]; got != "/usr/local/bin/self" {
-t.Errorf("command = %v, want /usr/local/bin/self", got)
-}
-
-env, ok := cs["env"].(map[string]any)
-if !ok {
-t.Fatal("missing env key")
-}
-
-registryJSON, ok := env["CODESPACE_REGISTRY"].(string)
-if !ok || registryJSON == "" {
-t.Fatal("missing CODESPACE_REGISTRY env var")
-}
-
-var entries []registryEntry
-if err := json.Unmarshal([]byte(registryJSON), &entries); err != nil {
-t.Fatalf("invalid CODESPACE_REGISTRY JSON: %v", err)
-}
-if len(entries) != 1 {
-t.Fatalf("got %d entries, want 1", len(entries))
-}
-if entries[0].Alias != "github" {
-t.Errorf("alias = %q, want %q", entries[0].Alias, "github")
-}
+	_, err := registryFromEntries(context.Background(), entries, func(_ context.Context, entry registryEntry) (*registry.ManagedCodespace, error) {
+		return &registry.ManagedCodespace{
+			Alias:      entry.Alias,
+			Name:       entry.Name,
+			Repository: entry.Repository,
+			Branch:     entry.Branch,
+			Workdir:    entry.Workdir,
+		}, nil
+	})
+	if err == nil {
+		t.Fatal("expected error for duplicate codespace name")
+	}
+	if !strings.Contains(err.Error(), `already connected as alias "graph-hopper"`) {
+		t.Fatalf("expected existing alias in error, got %q", err)
+	}
 }

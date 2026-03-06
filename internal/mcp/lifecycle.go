@@ -24,7 +24,7 @@ type DeployFunc func(sshClient *ssh.Client, codespaceName string) (string, error
 // LifecycleConfig holds dependencies for lifecycle tool handlers.
 type LifecycleConfig struct {
 	GHRunner     GHRunner
-	DeployFunc   DeployFunc               // optional: deploy exec agent after SSH setup
+	DeployFunc   DeployFunc                // optional: deploy exec agent after SSH setup
 	Provisioners []provisioner.Provisioner // optional: run after setup
 }
 
@@ -273,6 +273,9 @@ func connectCodespaceHandler(reg *registry.Registry, cfg LifecycleConfig) server
 		csName, err := requiredString(req, "name")
 		if err != nil {
 			return toolError(err.Error()), nil
+		}
+		if existing := reg.FindByName(csName); existing != nil {
+			return toolError(fmt.Sprintf("codespace %q already connected as alias %q", csName, existing.Alias)), nil
 		}
 		alias := optionalString(req, "alias")
 		if alias == "" {

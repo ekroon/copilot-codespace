@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -89,6 +90,21 @@ func TestRegister_DuplicateAlias(t *testing.T) {
 	err := reg.Register(newStubCS("github", "cs-def", "github/github"))
 	if err == nil {
 		t.Fatal("expected error for duplicate alias")
+	}
+}
+
+func TestRegister_DuplicateCodespaceName(t *testing.T) {
+	reg := New()
+	if err := reg.Register(newStubCS("graph-hopper", "graph-hopper-pre-prod-97pxr4rj4cpg79", "acme/graph-hopper")); err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+
+	err := reg.Register(newStubCS("graph-hopper-pre-prod-97pxr4rj4cpg79", "graph-hopper-pre-prod-97pxr4rj4cpg79", "acme/graph-hopper"))
+	if err == nil {
+		t.Fatal("expected error for duplicate codespace name")
+	}
+	if !strings.Contains(err.Error(), `already connected as alias "graph-hopper"`) {
+		t.Fatalf("expected existing alias in error, got %q", err)
 	}
 }
 
