@@ -172,10 +172,6 @@ func registryFromJSON(data string) (*registry.Registry, error) {
 }
 
 func registryFromEntries(ctx context.Context, entries []registryEntry, build func(context.Context, registryEntry) (*registry.ManagedCodespace, error)) (*registry.Registry, error) {
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("empty registry")
-	}
-
 	reg := registry.New()
 	for _, e := range entries {
 		cs, err := build(ctx, e)
@@ -246,17 +242,17 @@ func runLauncher(args []string) error {
 			selectedList = append(selectedList, cs)
 		}
 	} else {
-		selected, err := selectCodespace()
+		selectedList, err = selectCodespaces()
 		if err != nil {
 			return err
 		}
-		selectedList = append(selectedList, selected)
 	}
 
 	ctx := context.Background()
 	reg := registry.New()
 	var firstSSHClient *ssh.Client
 	var firstWorkdir, firstRemoteBinary string
+	var instructionsDir string
 	var allRemoteMCPServers map[string]any
 
 	for _, selected := range selectedList {
@@ -317,21 +313,32 @@ func runLauncher(args []string) error {
 		}
 	}
 
-	// Use the first codespace for instruction fetching (primary codespace)
-	primary := selectedList[0]
+	// Create a workspace manifest for --resume support. Empty sessions reuse this
+	// directory as the local bootstrap workspace until a codespace is connected.
+	ws, wsErr := workspace.New(sessionName)
 
-	// Fetch instruction files into a deterministic dir that acts as the cwd
-	instructionsDir, remoteMCPServers, err := fetchInstructionFiles(firstSSHClient, primary.Name, firstWorkdir, firstRemoteBinary)
-	if err != nil {
-		return fmt.Errorf("fetching instructions: %w", err)
-	}
-	allRemoteMCPServers = remoteMCPServers
+	if len(selectedList) > 0 {
+		primary := selectedList[0]
 
-	// Prepend codespace context to copilot-instructions.md
-	if reg.Len() > 1 {
-		writeMultiCodespaceInstructionsPreamble(instructionsDir, reg)
+		// Fetch instruction files into a deterministic dir that acts as the cwd
+		instructionsDir, allRemoteMCPServers, err = fetchInstructionFiles(firstSSHClient, primary.Name, firstWorkdir, firstRemoteBinary)
+		if err != nil {
+			return fmt.Errorf("fetching instructions: %w", err)
+		}
+
+		// Prepend codespace context to copilot-instructions.md
+		if reg.Len() > 1 {
+			writeMultiCodespaceInstructionsPreamble(instructionsDir, reg)
+		} else {
+			writeCodespaceInstructionsPreamble(instructionsDir, firstWorkdir)
+		}
 	} else {
-		writeCodespaceInstructionsPreamble(instructionsDir, firstWorkdir)
+		if wsErr != nil {
+			return fmt.Errorf("creating workspace: %w", wsErr)
+		}
+		instructionsDir = ws.Dir
+		writeZeroCodespaceInstructionsPreamble(instructionsDir)
+		fmt.Println("No codespaces selected. Start with create_codespace or connect_codespace from the agent.")
 	}
 
 	// Ensure the directory is trusted by copilot so it doesn't prompt each time
@@ -348,7 +355,9 @@ func runLauncher(args []string) error {
 	}
 
 	// Generate a postToolUse hook to keep the branch in sync
-	generateBranchSyncHook(instructionsDir, primary.Name, firstWorkdir, firstSSHClient)
+	if len(selectedList) > 0 {
+		generateBranchSyncHook(instructionsDir, selectedList[0].Name, firstWorkdir, firstSSHClient)
+	}
 
 	// Generate remote-explorer custom agent for codespace file exploration
 	generateRemoteExplorerAgent(instructionsDir)
@@ -380,8 +389,6 @@ func runLauncher(args []string) error {
 		}
 	}
 
-	// Save workspace manifest for --resume
-	ws, wsErr := workspace.New(sessionName)
 	if wsErr == nil {
 		for _, cs := range reg.All() {
 			ws.AddCodespace(cs.Alias, workspace.CodespaceEntry{
@@ -391,11 +398,17 @@ func runLauncher(args []string) error {
 				Workdir:    cs.Workdir,
 			})
 		}
-		ws.Save()
-		fmt.Printf("  Session:   %s (resume with --resume %s)\n", ws.Name, ws.Name)
+		if err := ws.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not save workspace manifest: %v\n", err)
+		} else {
+			fmt.Printf("  Session:   %s (resume with --resume %s)\n", ws.Name, ws.Name)
+		}
 	}
 
 	fmt.Printf("\nLaunching Copilot CLI with remote codespace tools...\n")
+	if reg.Len() == 0 {
+		fmt.Printf("  Codespace: none connected yet\n")
+	}
 	for _, cs := range reg.All() {
 		fmt.Printf("  Codespace: %s (alias: %s, repo: %s)\n", cs.Name, cs.Alias, cs.Repository)
 	}
@@ -434,22 +447,22 @@ func lookupCodespace(name string) (codespace, error) {
 	return codespace{}, fmt.Errorf("codespace %q not found", name)
 }
 
-// selectCodespace lets the user pick a codespace interactively.
-// Uses gum filter for fuzzy search if available, otherwise falls back to a numbered list.
-func selectCodespace() (codespace, error) {
+// selectCodespaces lets the user pick zero, one, or many codespaces interactively.
+// Uses gum filter for fuzzy multi-select if available, otherwise falls back to a numbered list.
+func selectCodespaces() ([]codespace, error) {
 	out, err := exec.Command("gh", "codespace", "list",
 		"--json", "name,displayName,repository,state",
 		"--limit", "50").Output()
 	if err != nil {
-		return codespace{}, fmt.Errorf("listing codespaces: %w", err)
+		return nil, fmt.Errorf("listing codespaces: %w", err)
 	}
 
 	var codespaces []codespace
 	if err := json.Unmarshal(out, &codespaces); err != nil {
-		return codespace{}, fmt.Errorf("parsing codespace list: %w", err)
+		return nil, fmt.Errorf("parsing codespace list: %w", err)
 	}
 	if len(codespaces) == 0 {
-		return codespace{}, fmt.Errorf("no codespaces found")
+		return nil, nil
 	}
 
 	// Sort: available first, then by display name
@@ -473,23 +486,20 @@ func selectCodespace() (codespace, error) {
 	// Try gum filter for fuzzy interactive picker
 	if gumPath, err := exec.LookPath("gum"); err == nil {
 		displayLines := make([]string, len(lines))
+		byDisplay := make(map[string]codespace, len(lines))
 		for i, l := range lines {
 			// Show only the display part (after tab) in the picker
 			parts := strings.SplitN(l, "\t", 2)
 			displayLines[i] = parts[1]
+			byDisplay[displayLines[i]] = codespaces[i]
 		}
 
-		cmd := exec.Command(gumPath, "filter", "--placeholder", "Choose codespace...")
+		cmd := exec.Command(gumPath, "filter", "--no-limit", "--placeholder", "Choose codespace(s)...")
 		cmd.Stdin = strings.NewReader(strings.Join(displayLines, "\n"))
 		cmd.Stderr = os.Stderr
 		selected, err := cmd.Output()
 		if err == nil {
-			choice := strings.TrimSpace(string(selected))
-			for i, dl := range displayLines {
-				if dl == choice {
-					return codespaces[i], nil
-				}
-			}
+			return resolveSelectedCodespaces(strings.Split(strings.TrimSpace(string(selected)), "\n"), byDisplay), nil
 		}
 		// gum failed (e.g., no TTY), fall through to numbered list
 	}
@@ -500,17 +510,66 @@ func selectCodespace() (codespace, error) {
 		fmt.Printf("  %2d) %s\n", i+1, parts[1])
 	}
 
-	fmt.Printf("\nSelect [1-%d]: ", len(codespaces))
+	fmt.Printf("\nSelect [1-%d] (comma-separated, blank for none): ", len(codespaces))
 	reader := bufio.NewReader(os.Stdin)
 	input, err := reader.ReadString('\n')
 	if err != nil {
-		return codespace{}, fmt.Errorf("reading input: %w", err)
+		return nil, fmt.Errorf("reading input: %w", err)
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(input))
-	if err != nil || n < 1 || n > len(codespaces) {
-		return codespace{}, fmt.Errorf("invalid selection")
+	indices, err := parseSelectionIndices(input, len(codespaces))
+	if err != nil {
+		return nil, err
 	}
-	return codespaces[n-1], nil
+
+	selected := make([]codespace, 0, len(indices))
+	for _, idx := range indices {
+		selected = append(selected, codespaces[idx])
+	}
+	return selected, nil
+}
+
+func resolveSelectedCodespaces(selected []string, byDisplay map[string]codespace) []codespace {
+	result := make([]codespace, 0, len(selected))
+	seen := make(map[string]bool, len(selected))
+	for _, choice := range selected {
+		choice = strings.TrimSpace(choice)
+		if choice == "" {
+			continue
+		}
+		cs, ok := byDisplay[choice]
+		if !ok || seen[cs.Name] {
+			continue
+		}
+		seen[cs.Name] = true
+		result = append(result, cs)
+	}
+	return result
+}
+
+func parseSelectionIndices(input string, max int) ([]int, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return nil, nil
+	}
+
+	parts := strings.FieldsFunc(input, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	})
+	selected := make([]int, 0, len(parts))
+	seen := make(map[int]bool, len(parts))
+	for _, part := range parts {
+		n, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil || n < 1 || n > max {
+			return nil, fmt.Errorf("invalid selection")
+		}
+		idx := n - 1
+		if seen[idx] {
+			continue
+		}
+		seen[idx] = true
+		selected = append(selected, idx)
+	}
+	return selected, nil
 }
 
 func startCodespace(name string) error {
@@ -881,7 +940,7 @@ func buildMCPConfig(selfBinary, codespaceName, workdir string, remoteMCPServers 
 }
 
 // buildMCPConfigWithRegistry creates the MCP config JSON using the full registry.
-// Uses CODESPACE_REGISTRY env var (JSON array) for multi-codespace support.
+// Uses CODESPACE_REGISTRY env var (JSON array) for zero-, single-, or multi-codespace support.
 func buildMCPConfigWithRegistry(selfBinary string, reg *registry.Registry, remoteMCPServers map[string]any) string {
 	// Serialize registry entries for the MCP server process
 	var entries []registryEntry
@@ -964,6 +1023,36 @@ func writeMultiCodespaceInstructionsPreamble(mirrorDir string, reg *registry.Reg
 		return
 	}
 	os.WriteFile(instructionsPath, []byte(sb.String()+string(existing)), 0o644)
+}
+
+// writeZeroCodespaceInstructionsPreamble bootstraps a local session before any
+// codespace has been connected, so the agent knows to use lifecycle tools first.
+func writeZeroCodespaceInstructionsPreamble(mirrorDir string) {
+	preamble := `# Codespace Lifecycle Session
+
+You are not connected to any remote GitHub Codespaces yet, so project source code is not available locally.
+
+## What to do first
+
+- Use ` + "`list_available_codespaces`" + ` to discover existing codespaces you can connect to.
+- Use ` + "`get_codespace_options`" + ` and then ` + "`create_codespace`" + ` to create a new codespace for the repository you need.
+- Use ` + "`connect_codespace`" + ` to attach an existing codespace to this session.
+- After at least one codespace is connected, use ` + "`list_codespaces`" + ` to confirm aliases, then use the ` + "`remote_*`" + ` tools for source-code work.
+- **Local session files** (plan.md, session state, notes under ~/.copilot/): use the built-in local tools (view, edit, create).
+
+`
+
+	instructionsPath := filepath.Join(mirrorDir, ".github", "copilot-instructions.md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o755); err != nil {
+		return
+	}
+
+	existing, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		os.WriteFile(instructionsPath, []byte(preamble), 0o644)
+		return
+	}
+	os.WriteFile(instructionsPath, []byte(preamble+string(existing)), 0o644)
 }
 
 // rewriteMCPServerForSSH rewrites an MCP server config to forward its stdio over SSH.
@@ -1314,10 +1403,6 @@ func runResume(sessionName string, copilotArgs []string) error {
 		return fmt.Errorf("loading workspace %q: %w", sessionName, err)
 	}
 
-	if len(ws.Manifest.Codespaces) == 0 {
-		return fmt.Errorf("workspace %q has no codespaces", sessionName)
-	}
-
 	fmt.Printf("Resuming workspace %q...\n", sessionName)
 
 	self, err := os.Executable()
@@ -1327,6 +1412,7 @@ func runResume(sessionName string, copilotArgs []string) error {
 
 	ctx := context.Background()
 	reg := registry.New()
+	hadCodespaces := len(ws.Manifest.Codespaces) > 0
 
 	for alias, entry := range ws.Manifest.Codespaces {
 		fmt.Printf("  Reconnecting %s (%s)...\n", alias, entry.Name)
@@ -1357,7 +1443,7 @@ func runResume(sessionName string, copilotArgs []string) error {
 		fmt.Printf("  ✓ %s connected\n", alias)
 	}
 
-	if reg.Len() == 0 {
+	if hadCodespaces && reg.Len() == 0 {
 		return fmt.Errorf("no codespaces could be reconnected")
 	}
 
@@ -1375,6 +1461,8 @@ func runResume(sessionName string, copilotArgs []string) error {
 		} else {
 			writeCodespaceInstructionsPreamble(instructionsDir, primary.Workdir)
 		}
+	} else {
+		writeZeroCodespaceInstructionsPreamble(instructionsDir)
 	}
 
 	if err := ensureTrustedFolder(instructionsDir); err != nil {
@@ -1395,6 +1483,9 @@ func runResume(sessionName string, copilotArgs []string) error {
 	}
 
 	fmt.Printf("\nResuming with %d codespace(s)...\n", reg.Len())
+	if reg.Len() == 0 {
+		fmt.Printf("  none connected yet\n")
+	}
 	for _, cs := range reg.All() {
 		fmt.Printf("  %s: %s (%s)\n", cs.Alias, cs.Name, cs.Repository)
 	}

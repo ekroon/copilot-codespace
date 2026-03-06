@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -451,6 +452,41 @@ func TestRewriteHooksForSSH_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestParseSelectionIndices(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		max     int
+		want    []int
+		wantErr bool
+	}{
+		{name: "blank means none", input: "", max: 4, want: nil},
+		{name: "single selection", input: "2", max: 4, want: []int{1}},
+		{name: "multiple selections", input: "1, 3 4", max: 4, want: []int{0, 2, 3}},
+		{name: "duplicate selections deduped", input: "2,2, 2", max: 4, want: []int{1}},
+		{name: "out of range", input: "5", max: 4, wantErr: true},
+		{name: "invalid token", input: "abc", max: 4, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseSelectionIndices(tt.input, tt.max)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildMCPConfigWithRegistry(t *testing.T) {
 	reg := registry.New()
 	reg.Register(&registry.ManagedCodespace{
@@ -494,6 +530,64 @@ func TestBuildMCPConfigWithRegistry(t *testing.T) {
 	}
 	if entries[0].Alias != "github" {
 		t.Errorf("alias = %q, want %q", entries[0].Alias, "github")
+	}
+}
+
+func TestBuildMCPConfigWithRegistry_EmptyRegistry(t *testing.T) {
+	reg := registry.New()
+
+	result := buildMCPConfigWithRegistry("/usr/local/bin/self", reg, nil)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	servers := parsed["mcpServers"].(map[string]any)
+	cs := servers["codespace"].(map[string]any)
+	env := cs["env"].(map[string]any)
+
+	registryJSON, ok := env["CODESPACE_REGISTRY"].(string)
+	if !ok {
+		t.Fatal("missing CODESPACE_REGISTRY env var")
+	}
+
+	var entries []registryEntry
+	if err := json.Unmarshal([]byte(registryJSON), &entries); err != nil {
+		t.Fatalf("invalid CODESPACE_REGISTRY JSON: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("got %d entries, want 0", len(entries))
+	}
+}
+
+func TestWriteZeroCodespaceInstructionsPreamble(t *testing.T) {
+	dir := t.TempDir()
+
+	writeZeroCodespaceInstructionsPreamble(dir)
+
+	data, err := os.ReadFile(filepath.Join(dir, ".github", "copilot-instructions.md"))
+	if err != nil {
+		t.Fatalf("reading instructions: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{"list_available_codespaces", "create_codespace", "connect_codespace", "remote_*"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in preamble, got %q", want, text)
+		}
+	}
+}
+
+func TestRegistryFromEntries_Empty(t *testing.T) {
+	reg, err := registryFromEntries(context.Background(), nil, func(_ context.Context, entry registryEntry) (*registry.ManagedCodespace, error) {
+		t.Fatalf("build should not be called for empty entries: %+v", entry)
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reg.Len() != 0 {
+		t.Fatalf("got %d codespaces, want 0", reg.Len())
 	}
 }
 

@@ -25,7 +25,7 @@ A single Go binary (`gh-copilot-codespace`) serves four roles:
 ## Prerequisites
 
 - `gh` CLI authenticated with `codespace` scope
-- At least one GitHub Codespace
+- `gh` permission to list, create, and connect GitHub Codespaces
 - [Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) installed (or available via `gh copilot`)
 
 ## Installation
@@ -44,7 +44,7 @@ go build -o gh-copilot-codespace ./cmd/gh-copilot-codespace
 ## Quick start
 
 ```bash
-# Via gh extension — single codespace (interactive picker)
+# Via gh extension — interactive picker (select zero, one, or many)
 gh copilot-codespace
 
 # Connect to a specific codespace
@@ -52,6 +52,9 @@ gh copilot-codespace -c my-codespace-name
 
 # Connect to multiple codespaces
 gh copilot-codespace -c codespace-1,codespace-2
+
+# Start with no codespaces, then create/connect from the agent
+gh copilot-codespace --name bootstrap-session
 
 # Name the session for later resume
 gh copilot-codespace --name my-session
@@ -65,6 +68,8 @@ gh copilot-codespace workspaces
 # Pass extra copilot flags
 gh copilot-codespace --model claude-sonnet-4.5
 ```
+
+If you launch without `-c/--codespace`, the interactive picker supports selecting multiple codespaces. Press Enter on a blank selection to start with no codespaces connected, then use `list_available_codespaces`, `create_codespace`, or `connect_codespace` from the agent.
 
 ## What gets fetched from the codespace
 
@@ -91,11 +96,11 @@ The launcher fetches all project-level Copilot CLI components in a single SSH ca
 
 When connecting to multiple codespaces, all `remote_*` MCP tools accept an optional `codespace` parameter (the alias). When only one codespace is connected, this parameter is optional.
 
-The agent can also create, connect to, and delete codespaces on the fly using `create_codespace`, `connect_codespace`, and `delete_codespace` tools.
+The agent can also create, connect to, and delete codespaces on the fly using `create_codespace`, `connect_codespace`, and `delete_codespace` tools. Starting with zero connected codespaces is supported, so you can bootstrap a brand-new session and create the first codespace from inside the agent.
 
 ## Session resume
 
-Workspace sessions are saved to `~/.copilot/workspaces/` with a manifest (`workspace.json`) tracking connected codespaces. Use `--resume` to reconnect:
+Workspace sessions are saved to `~/.copilot/workspaces/` with a manifest (`workspace.json`) tracking connected codespaces. Empty sessions are resumable too, which is useful when you want to launch first and create/connect codespaces later from the agent. Use `--resume` to reconnect:
 
 ```bash
 # First session
