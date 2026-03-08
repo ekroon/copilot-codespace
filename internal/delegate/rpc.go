@@ -83,6 +83,21 @@ func (c *rpcClient) Call(ctx context.Context, method string, params any, result 
 
 	select {
 	case <-ctx.Done():
+		// Context canceled before a response arrived: remove pending entry to
+		// prevent deliverResponse from finding it. If deliverResponse already
+		// holds a reference to responseCh and is about to send, the drain
+		// goroutine below consumes it so the buffered channel isn't stranded.
+		// The default case is intentional: if deliverResponse already saw the
+		// deleted entry (and thus won't send), the goroutine must not block.
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		go func(ch <-chan rpcResponse) {
+			select {
+			case <-ch:
+			default:
+			}
+		}(responseCh)
 		return ctx.Err()
 	case resp := <-responseCh:
 		if resp.Error != nil {
@@ -134,25 +149,10 @@ func (c *rpcClient) readLoop() {
 
 func (c *rpcClient) handleRequest(id json.RawMessage, method string, params json.RawMessage) {
 	switch method {
-	case "permission.request":
+	case "requestPermission":
 		_ = c.reply(id, map[string]any{
-			"result": map[string]any{
-				"kind": "approved",
-			},
-		})
-	case "hooks.invoke":
-		_ = c.reply(id, map[string]any{})
-	case "userInput.request":
-		_ = c.reply(id, map[string]any{
-			"answer":      "",
-			"wasFreeform": true,
-		})
-	case "tool.call":
-		_ = c.reply(id, map[string]any{
-			"result": map[string]any{
-				"resultType":       "denied",
-				"textResultForLlm": "No local delegate tools are registered.",
-				"error":            "No local delegate tools are registered.",
+			"outcome": map[string]any{
+				"outcome": "approved",
 			},
 		})
 	default:
@@ -193,7 +193,6 @@ func (c *rpcClient) failPending(err error) {
 }
 
 func (c *rpcClient) readMessage() (rpcEnvelope, error) {
-	var contentLength int
 	for {
 		line, err := c.reader.ReadString('\n')
 		if err != nil {
@@ -201,33 +200,14 @@ func (c *rpcClient) readMessage() (rpcEnvelope, error) {
 		}
 		line = strings.TrimRight(line, "\r\n")
 		if line == "" {
-			break
+			continue
 		}
-		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
-			value := strings.TrimSpace(strings.TrimPrefix(line, "Content-Length:"))
-			if value == line {
-				value = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "content-length:"))
-			}
-			contentLength, err = strconv.Atoi(value)
-			if err != nil {
-				return rpcEnvelope{}, fmt.Errorf("invalid content length %q: %w", value, err)
-			}
+		var msg rpcEnvelope
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			return rpcEnvelope{}, fmt.Errorf("decoding NDJSON message: %w", err)
 		}
+		return msg, nil
 	}
-	if contentLength <= 0 {
-		return rpcEnvelope{}, fmt.Errorf("missing content length")
-	}
-
-	payload := make([]byte, contentLength)
-	if _, err := io.ReadFull(c.reader, payload); err != nil {
-		return rpcEnvelope{}, err
-	}
-
-	var msg rpcEnvelope
-	if err := json.Unmarshal(payload, &msg); err != nil {
-		return rpcEnvelope{}, fmt.Errorf("decoding JSON-RPC message: %w", err)
-	}
-	return msg, nil
 }
 
 func (c *rpcClient) reply(id json.RawMessage, result any) error {
@@ -254,13 +234,11 @@ func (c *rpcClient) writeMessage(message rpcEnvelope) error {
 	if err != nil {
 		return err
 	}
+	payload = append(payload, '\n')
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	if _, err := fmt.Fprintf(c.rwc, "Content-Length: %d\r\n\r\n", len(payload)); err != nil {
-		return err
-	}
 	_, err = c.rwc.Write(payload)
 	return err
 }

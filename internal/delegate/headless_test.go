@@ -20,7 +20,7 @@ func TestDefaultCommandFactory_WithExecAgent(t *testing.T) {
 		"gh codespace ssh -c my-codespace -- /tmp/gh-copilot-codespace exec --workdir /workspaces/repo",
 		"--env COPILOT_GITHUB_TOKEN=token",
 		"--env GH_TOKEN=token",
-		"copilot --headless --stdio --yolo --log-level error",
+		"copilot --acp --stdio --yolo --log-level error",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected %q in %q", want, got)
@@ -37,7 +37,7 @@ func TestDefaultCommandFactory_WithoutExecAgent(t *testing.T) {
 	got := strings.Join(cmd.Args, " ")
 	for _, want := range []string{
 		"gh codespace ssh -c my-codespace -- bash -lc",
-		"copilot --headless --stdio --yolo --log-level error",
+		"copilot --acp --stdio --yolo --log-level error",
 		"export 'COPILOT_GITHUB_TOKEN=token'",
 	} {
 		if !strings.Contains(got, want) {

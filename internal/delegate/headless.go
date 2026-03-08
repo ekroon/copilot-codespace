@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -89,102 +88,81 @@ func (r *HeadlessRunner) RunTask(ctx context.Context, opts StartOptions, progres
 }
 
 func runHeadlessSession(ctx context.Context, rpc *rpcClient, opts StartOptions, progress ProgressFunc) (string, error) {
-	progress(fmt.Sprintf("Starting headless delegate on %s.", opts.CodespaceName))
+	progress(fmt.Sprintf("Starting ACP delegate on %s.", opts.CodespaceName))
 
-	params := map[string]any{
-		"clientName":        "gh-copilot-codespace",
-		"requestPermission": true,
-		"requestUserInput":  false,
-		"hooks":             false,
-		"workingDirectory":  opts.Cwd,
-		"envValueMode":      "direct",
-		"streaming":         false,
-	}
-	if opts.Model != "" {
-		params["model"] = opts.Model
+	// Step 1: Initialize the ACP connection.
+	if err := rpc.Call(ctx, "initialize", map[string]any{
+		"protocolVersion":    1,
+		"clientCapabilities": map[string]any{},
+	}, nil); err != nil {
+		return "", fmt.Errorf("initializing ACP connection: %w", err)
 	}
 
-	var createResp struct {
+	// Step 2: Create a session.
+	var sessionResp struct {
 		SessionID string `json:"sessionId"`
 	}
-	if err := rpc.Call(ctx, "session.create", params, &createResp); err != nil {
-		return "", fmt.Errorf("creating remote delegate session: %w", err)
+	sessionParams := map[string]any{
+		"cwd":        opts.Cwd,
+		"mcpServers": []any{},
 	}
-	progress(fmt.Sprintf("Created delegate session %s.", createResp.SessionID))
+	if opts.Model != "" {
+		sessionParams["model"] = opts.Model
+	}
+	if err := rpc.Call(ctx, "session/new", sessionParams, &sessionResp); err != nil {
+		return "", fmt.Errorf("creating ACP session: %w", err)
+	}
+	progress(fmt.Sprintf("Created ACP session %s.", sessionResp.SessionID))
 
-	idleCh := make(chan struct{}, 1)
-	errCh := make(chan error, 1)
-	var resultMu sync.Mutex
-	var finalMessage string
+	// Accumulate text chunks delivered via session/update notifications.
+	var textMu sync.Mutex
+	var accumulated strings.Builder
 
 	rpc.SetEventHandler(func(method string, params json.RawMessage) {
-		switch method {
-		case "session.event":
-			var notification struct {
-				SessionID string `json:"sessionId"`
-				Event     struct {
-					Type string          `json:"type"`
-					Data json.RawMessage `json:"data"`
-				} `json:"event"`
-			}
-			if err := json.Unmarshal(params, &notification); err != nil {
-				return
-			}
-			if notification.SessionID != createResp.SessionID {
-				return
-			}
-
-			switch notification.Event.Type {
-			case "assistant.message":
-				if text := extractMessageContent(notification.Event.Data); text != "" {
-					resultMu.Lock()
-					finalMessage = text
-					resultMu.Unlock()
-					progress("Received final assistant response.")
-				}
-			case "session.error":
-				select {
-				case errCh <- extractSessionError(notification.Event.Data):
-				default:
-				}
-			case "session.idle":
-				select {
-				case idleCh <- struct{}{}:
-				default:
-				}
-			}
-		case "session.lifecycle":
-			var notification struct {
-				Type string `json:"type"`
-			}
-			if err := json.Unmarshal(params, &notification); err == nil && notification.Type != "" {
-				progress(fmt.Sprintf("Lifecycle event: %s.", notification.Type))
-			}
+		if method != "session/update" {
+			return
+		}
+		var notification struct {
+			SessionID string `json:"sessionId"`
+			Update    struct {
+				SessionUpdate string `json:"sessionUpdate"`
+				Content       struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"update"`
+		}
+		if err := json.Unmarshal(params, &notification); err != nil {
+			return
+		}
+		if notification.SessionID != sessionResp.SessionID {
+			return
+		}
+		if notification.Update.SessionUpdate == "agent_message_chunk" && notification.Update.Content.Type == "text" {
+			textMu.Lock()
+			accumulated.WriteString(notification.Update.Content.Text)
+			textMu.Unlock()
 		}
 	})
 
-	var sendResp struct {
-		MessageID string `json:"messageId"`
+	// Step 3: Send the prompt. This call blocks until the agent finishes.
+	promptContent := []map[string]any{{"type": "text", "text": opts.Prompt}}
+	var promptResp struct {
+		StopReason string `json:"stopReason"`
 	}
-	if err := rpc.Call(ctx, "session.send", map[string]any{
-		"sessionId": createResp.SessionID,
-		"prompt":    opts.Prompt,
-	}, &sendResp); err != nil {
-		return "", fmt.Errorf("sending delegate prompt: %w", err)
+	if err := rpc.Call(ctx, "session/prompt", map[string]any{
+		"sessionId": sessionResp.SessionID,
+		"prompt":    promptContent,
+	}, &promptResp); err != nil {
+		return "", fmt.Errorf("sending ACP prompt: %w", err)
 	}
+	progress(fmt.Sprintf("ACP session completed (stopReason=%s).", promptResp.StopReason))
 
-	for {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case err := <-errCh:
-			return "", err
-		case <-idleCh:
-			resultMu.Lock()
-			defer resultMu.Unlock()
-			return finalMessage, nil
-		}
-	}
+	textMu.Lock()
+	result := accumulated.String()
+	textMu.Unlock()
+
+	return result, nil
 }
 
 func defaultCommandFactory(ctx context.Context, opts StartOptions, envPairs []string) *exec.Cmd {
@@ -199,7 +177,7 @@ func defaultCommandFactory(ctx context.Context, opts StartOptions, envPairs []st
 		for _, pair := range envPairs {
 			args = append(args, "--env", pair)
 		}
-		args = append(args, "--", "copilot", "--headless", "--stdio", "--yolo", "--log-level", "error")
+		args = append(args, "--", "copilot", "--acp", "--stdio", "--yolo", "--log-level", "error")
 		return exec.CommandContext(ctx, "gh", args...)
 	}
 
@@ -209,7 +187,7 @@ func defaultCommandFactory(ctx context.Context, opts StartOptions, envPairs []st
 	}
 	scriptParts := []string{"cd " + shellQuote(workdir)}
 	scriptParts = append(scriptParts, exports...)
-	scriptParts = append(scriptParts, "exec copilot --headless --stdio --yolo --log-level error")
+	scriptParts = append(scriptParts, "exec copilot --acp --stdio --yolo --log-level error")
 	args = append(args, "bash", "-lc", strings.Join(scriptParts, " && "))
 	return exec.CommandContext(ctx, "gh", args...)
 }
@@ -240,30 +218,6 @@ func authEnvPairs(token string) []string {
 	}
 	sort.Strings(pairs)
 	return pairs
-}
-
-func extractMessageContent(data json.RawMessage) string {
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return ""
-	}
-	if content, ok := payload["content"].(string); ok {
-		return content
-	}
-	return ""
-}
-
-func extractSessionError(data json.RawMessage) error {
-	var payload struct {
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return fmt.Errorf("remote delegate session failed")
-	}
-	if payload.Message == "" {
-		return fmt.Errorf("remote delegate session failed")
-	}
-	return errors.New(payload.Message)
 }
 
 func decorateHeadlessError(err error, stderr string) error {
