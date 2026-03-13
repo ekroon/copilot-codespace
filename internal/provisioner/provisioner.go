@@ -16,7 +16,7 @@ type Provisioner interface {
 
 // RunContext provides information for deciding whether a provisioner should run.
 type RunContext struct {
-	Terminal       string // e.g., "xterm-ghostty"
+	Terminal       string // detected terminal identifier used for matching (e.g., "xterm-ghostty")
 	Repository     string // e.g., "github/github"
 	IsNewCodespace bool   // true if the codespace was just created
 }
@@ -27,6 +27,7 @@ type CodespaceTarget interface {
 	Repository() string
 	Workdir() string
 	RunSSH(ctx context.Context, command string) (string, error)
+	UploadTerminfo(ctx context.Context, term string) error
 }
 
 // RunAll executes all provisioners whose ShouldRun returns true.
@@ -46,30 +47,44 @@ func RunAll(ctx context.Context, provisioners []Provisioner, rctx RunContext, ta
 
 // --- Built-in provisioners ---
 
-// TerminfoProvisioner uploads terminal info to the codespace for non-standard terminals.
+// TerminfoProvisioner uploads local terminfo entries that the codespace may not have.
 type TerminfoProvisioner struct{}
 
 func (p *TerminfoProvisioner) Name() string { return "terminfo" }
 
 func (p *TerminfoProvisioner) ShouldRun(ctx RunContext) bool {
-	term := ctx.Terminal
-	// Only run for non-standard terminals that codespaces likely don't have
-	return term != "" && !isStandardTerminal(term)
+	return ctx.Terminal != "" && !isStandardTerminal(ctx.Terminal)
 }
 
 func (p *TerminfoProvisioner) Run(ctx context.Context, target CodespaceTarget) error {
-	term := os.Getenv("TERM")
-	if term == "" {
+	term := DetectedTerminal(os.Getenv("TERM"))
+	if term == "" || isStandardTerminal(term) {
 		return nil
 	}
-	// infocmp outputs the terminfo, tic compiles it on the remote
-	// This is piped: local infocmp → ssh → remote tic
-	_, err := target.RunSSH(ctx, fmt.Sprintf("infocmp -x %s 2>/dev/null | tic -x - 2>/dev/null", term))
-	return err
+	if err := target.UploadTerminfo(ctx, term); err != nil {
+		return fmt.Errorf("%s: %v", term, err)
+	}
+	return nil
+}
+
+// DetectedTerminal normalizes the current local terminal into the identifier
+// used for provisioner matching. Ghostty sessions always normalize to
+// xterm-ghostty even when the local TERM is overridden.
+func DetectedTerminal(term string) string {
+	if isGhosttySession() {
+		return "xterm-ghostty"
+	}
+	return term
+}
+
+func isGhosttySession() bool {
+	return strings.EqualFold(os.Getenv("TERM_PROGRAM"), "ghostty") ||
+		os.Getenv("GHOSTTY_RESOURCES_DIR") != "" ||
+		os.Getenv("TERM") == "xterm-ghostty"
 }
 
 func isStandardTerminal(term string) bool {
-	standard := []string{"xterm", "xterm-256color", "screen", "screen-256color", "tmux", "tmux-256color", "linux", "vt100", "dumb"}
+	standard := []string{"xterm", "xterm-color", "xterm-256color", "screen", "screen-256color", "tmux", "tmux-256color", "linux", "vt100", "dumb"}
 	for _, s := range standard {
 		if term == s {
 			return true

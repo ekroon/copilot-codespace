@@ -3,8 +3,10 @@ package ssh
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -240,9 +242,10 @@ type fakeExecCall struct {
 }
 
 type fakeExecResponse struct {
-	stdout   string
-	stderr   string
-	exitCode int
+	stdout    string
+	stderr    string
+	exitCode  int
+	stdinPath string
 }
 
 func fakeCommandContext(t *testing.T, calls *[]fakeExecCall, responses []fakeExecResponse) func(context.Context, string, ...string) *exec.Cmd {
@@ -266,6 +269,7 @@ func fakeCommandContext(t *testing.T, calls *[]fakeExecCall, responses []fakeExe
 			"GO_HELPER_STDOUT="+resp.stdout,
 			"GO_HELPER_STDERR="+resp.stderr,
 			"GO_HELPER_EXIT="+strconv.Itoa(resp.exitCode),
+			"GO_HELPER_STDIN_PATH="+resp.stdinPath,
 		)
 		return cmd
 	}
@@ -278,6 +282,10 @@ func TestCommandContextHelperProcess(t *testing.T) {
 
 	_, _ = os.Stdout.WriteString(os.Getenv("GO_HELPER_STDOUT"))
 	_, _ = os.Stderr.WriteString(os.Getenv("GO_HELPER_STDERR"))
+	if stdinPath := os.Getenv("GO_HELPER_STDIN_PATH"); stdinPath != "" {
+		data, _ := io.ReadAll(os.Stdin)
+		_ = os.WriteFile(stdinPath, data, 0o600)
+	}
 
 	exitCode, err := strconv.Atoi(os.Getenv("GO_HELPER_EXIT"))
 	if err != nil {
@@ -347,6 +355,40 @@ func TestRunBashUsesExplicitCwd(t *testing.T) {
 
 	wantCalls := []fakeExecCall{
 		{name: "gh", args: []string{"codespace", "ssh", "-c", "demo", "--", envSecretsLoader + " && cd '/workspaces/repo/app' && pwd"}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestUploadTerminfoPipesLocalOutputToRemote(t *testing.T) {
+	client := NewClient("demo")
+	client.sshConfigPath = "/tmp/ssh-config"
+	client.sshHost = "cs.demo"
+
+	stdinPath := filepath.Join(t.TempDir(), "remote-stdin.txt")
+
+	var calls []fakeExecCall
+	client.commandContext = fakeCommandContext(t, &calls, []fakeExecResponse{
+		{stdout: "xterm-ghostty terminfo\n"},
+		{stdinPath: stdinPath},
+	})
+
+	if err := client.UploadTerminfo(context.Background(), "xterm-ghostty"); err != nil {
+		t.Fatalf("UploadTerminfo() error = %v", err)
+	}
+
+	gotStdin, err := os.ReadFile(stdinPath)
+	if err != nil {
+		t.Fatalf("ReadFile(stdinPath): %v", err)
+	}
+	if string(gotStdin) != "xterm-ghostty terminfo\n" {
+		t.Fatalf("remote stdin = %q, want %q", string(gotStdin), "xterm-ghostty terminfo\n")
+	}
+
+	wantCalls := []fakeExecCall{
+		{name: "infocmp", args: []string{"-x", "xterm-ghostty"}},
+		{name: "ssh", args: []string{"-F", "/tmp/ssh-config", "cs.demo", envSecretsLoader + " && tic -x - >/dev/null 2>&1"}},
 	}
 	if !reflect.DeepEqual(calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)

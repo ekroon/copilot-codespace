@@ -138,14 +138,24 @@ When `--selected-only` was enabled, resume preserves the allowlist too: the **ex
 
 Provisioners run custom setup on codespaces after connection or creation. Built-in provisioners handle terminal info upload and git fetch automatically.
 
+Provisioners are loaded in both places:
+- when the launcher initially connects to selected/resumed codespaces
+- when the MCP lifecycle tools (`create_codespace` / `connect_codespace`) attach new codespaces later in the session
+
+For Ghostty, you usually do **not** need to copy your Ghostty config file into the codespace. The built-in `terminfo` provisioner uploads local terminfo entries into the codespace; when Ghostty is detected it always uploads `xterm-ghostty`, even if you override `$TERM` locally. That matches the intent of the legacy shell script. If you want extra Ghostty-specific setup beyond that, add a custom provisioner matched on `"terminal": "xterm-ghostty"`; Ghostty sessions are normalized to that detected terminal name for matching too. Custom `bash` provisioners still run on the codespace itself; the local-to-remote terminfo upload is specific to the built-in provisioner.
+
 Add custom provisioners in `~/.config/copilot-codespace/provisioners.json`:
 
 ```json
 {
+  "builtins": {
+    "terminfo": true,
+    "git-fetch": true
+  },
   "provisioners": [
     {
-      "name": "ghostty-terminfo",
-      "bash": "infocmp -x xterm-ghostty 2>/dev/null | tic -x - 2>/dev/null",
+      "name": "ghostty-shell-setup",
+      "bash": "echo 'export BAT_THEME=GitHub' >> ~/.bashrc",
       "match": { "terminal": "xterm-ghostty" }
     },
     {
@@ -161,11 +171,15 @@ Add custom provisioners in `~/.config/copilot-codespace/provisioners.json`:
 }
 ```
 
+Set a built-in to `false` if you want to disable it entirely.
+
 | Field | Description |
 |-------|-------------|
+| `builtins.terminfo` | Enable/disable the built-in terminfo upload provisioner (default: enabled) |
+| `builtins.git-fetch` | Enable/disable the built-in `git fetch origin` provisioner (default: enabled) |
 | `name` | Provisioner name (shown in logs) |
 | `bash` | Command to run on the codespace via SSH |
-| `match.terminal` | Only run when `$TERM` matches (e.g., `"xterm-ghostty"`) |
+| `match.terminal` | Only run when the detected local terminal matches (e.g., Ghostty normalizes to `"xterm-ghostty"` even if `$TERM` is overridden) |
 | `match.repository` | Only run for this repository (e.g., `"github/github"`) |
 
 Provisioners without `match` run on every codespace. Errors are logged but don't block connection.

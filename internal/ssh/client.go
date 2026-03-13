@@ -276,6 +276,42 @@ func (c *Client) runRemoteCommand(ctx context.Context, wrapped string, useMultip
 	return stdout, stderr, exitCode, nil
 }
 
+func (c *Client) runRemoteCommandWithInput(ctx context.Context, wrapped string, input []byte, useMultiplex bool) (stdout string, stderr string, exitCode int, err error) {
+	var cmd *exec.Cmd
+	if useMultiplex {
+		sshConfigPath, sshHost, _ := c.sshState()
+		cmd = c.command(ctx, "ssh", "-F", sshConfigPath, sshHost, wrapped)
+	} else {
+		cmd = c.command(ctx, "gh", "codespace", "ssh",
+			"-c", c.codespaceName,
+			"--", wrapped,
+		)
+	}
+
+	cmd.Stdin = bytes.NewReader(input)
+
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	runErr := cmd.Run()
+	stdout = outBuf.String()
+	stderr = errBuf.String()
+
+	if runErr != nil {
+		if ctx.Err() != nil {
+			return stdout, stderr, -1, fmt.Errorf("command cancelled: %w", ctx.Err())
+		}
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			return stdout, stderr, -1, fmt.Errorf("failed to execute command: %w", runErr)
+		}
+	}
+
+	return stdout, stderr, exitCode, nil
+}
+
 func (c *Client) disableMultiplexing() {
 	_, _, controlSocket := c.sshState()
 	if controlSocket != "" {
@@ -325,6 +361,53 @@ func (c *Client) Exec(ctx context.Context, command string) (stdout string, stder
 	wrapped := envSecretsLoader + " && " + command
 	sshConfigPath, _, _ := c.sshState()
 	return c.runRemoteCommand(ctx, wrapped, sshConfigPath != "")
+}
+
+// UploadTerminfo compiles a local terminfo entry into the remote codespace.
+func (c *Client) UploadTerminfo(ctx context.Context, term string) error {
+	var outBuf, errBuf bytes.Buffer
+	infocmp := c.command(ctx, "infocmp", "-x", term)
+	infocmp.Stdout = &outBuf
+	infocmp.Stderr = &errBuf
+
+	if err := infocmp.Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("infocmp %s: %w", term, ctx.Err())
+		}
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return formatCommandFailure("infocmp "+term, exitErr.ExitCode(), errBuf.String())
+		}
+		return fmt.Errorf("running infocmp for %s: %w", term, err)
+	}
+
+	wrapped := envSecretsLoader + " && tic -x - >/dev/null 2>&1"
+	sshConfigPath, _, _ := c.sshState()
+	useMultiplex := sshConfigPath != ""
+
+	_, stderr, exitCode, err := c.runRemoteCommandWithInput(ctx, wrapped, outBuf.Bytes(), useMultiplex)
+	if err != nil {
+		return fmt.Errorf("upload terminfo: %w", err)
+	}
+
+	trimmedStderr := strings.TrimSpace(stderr)
+	if !isRetryableTransportFailure(useMultiplex, exitCode, stderr) && !(useMultiplex && exitCode == 255 && trimmedStderr == "" && !c.probeMultiplexing(ctx)) {
+		if exitCode != 0 {
+			return formatCommandFailure("upload terminfo", exitCode, stderr)
+		}
+		return nil
+	}
+
+	fmt.Fprintln(os.Stderr, "codespace-mcp: SSH transport failed for terminfo upload, retrying without multiplexing")
+	c.disableMultiplexing()
+
+	_, stderr, exitCode, err = c.runRemoteCommandWithInput(ctx, wrapped, outBuf.Bytes(), false)
+	if err != nil {
+		return fmt.Errorf("upload terminfo: %w", err)
+	}
+	if exitCode != 0 {
+		return formatCommandFailure("upload terminfo", exitCode, stderr)
+	}
+	return nil
 }
 
 func (c *Client) execReadOnly(ctx context.Context, command string) (stdout string, stderr string, exitCode int, err error) {

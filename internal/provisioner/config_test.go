@@ -10,6 +10,9 @@ func TestLoadConfig_ValidJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "provisioners.json")
 	data := `{
+		"builtins": {
+			"terminfo": true
+		},
 		"provisioners": [
 			{"name": "test-prov", "bash": "echo hello"},
 			{"name": "matched", "bash": "echo matched", "match": {"terminal": "xterm-ghostty"}}
@@ -26,6 +29,35 @@ func TestLoadConfig_ValidJSON(t *testing.T) {
 	}
 	if provisioners[0].Name() != "test-prov" {
 		t.Errorf("got name %q, want %q", provisioners[0].Name(), "test-prov")
+	}
+}
+
+func TestLoadSettingsFrom_ParsesBuiltinToggles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "provisioners.json")
+	data := `{
+		"builtins": {
+			"terminfo": false,
+			"git-fetch": true
+		},
+		"provisioners": [
+			{"name": "test-prov", "bash": "echo hello"}
+		]
+	}`
+	os.WriteFile(path, []byte(data), 0o644)
+
+	config, err := LoadSettingsFrom(path)
+	if err != nil {
+		t.Fatalf("LoadSettingsFrom: %v", err)
+	}
+	if config.Builtins["terminfo"] {
+		t.Fatal("terminfo builtin should be disabled")
+	}
+	if !config.Builtins["git-fetch"] {
+		t.Fatal("git-fetch builtin should be enabled")
+	}
+	if len(config.Provisioners) != 1 {
+		t.Fatalf("got %d provisioner entries, want 1", len(config.Provisioners))
 	}
 }
 
@@ -58,6 +90,26 @@ func TestLoadConfig_WithMatch_Terminal(t *testing.T) {
 	// Should not run when terminal doesn't match
 	if provisioners[0].ShouldRun(RunContext{Terminal: "xterm-256color"}) {
 		t.Error("should not run when terminal doesn't match")
+	}
+}
+
+func TestLoadConfig_WithMatch_Terminal_UsesDetectedGhosttyName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "provisioners.json")
+	data := `{"provisioners": [{"name": "ghostty", "bash": "echo hi", "match": {"terminal": "xterm-ghostty"}}]}`
+	os.WriteFile(path, []byte(data), 0o644)
+
+	t.Setenv("TERM", "xterm-color")
+	t.Setenv("TERM_PROGRAM", "ghostty")
+	t.Setenv("GHOSTTY_RESOURCES_DIR", "/tmp/ghostty")
+
+	provisioners, _ := LoadConfigFrom(path)
+	if len(provisioners) != 1 {
+		t.Fatal("expected 1 provisioner")
+	}
+
+	if !provisioners[0].ShouldRun(RunContext{Terminal: DetectedTerminal(os.Getenv("TERM"))}) {
+		t.Error("should run when Ghostty is detected even if TERM is overridden")
 	}
 }
 

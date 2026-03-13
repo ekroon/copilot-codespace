@@ -10,12 +10,12 @@ import (
 
 // ConfigEntry represents a user-defined provisioner from config JSON.
 type ConfigEntry struct {
-	Name          string            `json:"name"`
-	Match         *MatchCondition   `json:"match,omitempty"`
-	Bash          string            `json:"bash,omitempty"`
-	LocalCommand  string            `json:"localCommand,omitempty"`
-	PipeToRemote  string            `json:"pipeToRemote,omitempty"`
-	RunOn         string            `json:"runOn,omitempty"` // "codespace" (default) or "local"
+	Name         string          `json:"name"`
+	Match        *MatchCondition `json:"match,omitempty"`
+	Bash         string          `json:"bash,omitempty"`
+	LocalCommand string          `json:"localCommand,omitempty"`
+	PipeToRemote string          `json:"pipeToRemote,omitempty"`
+	RunOn        string          `json:"runOn,omitempty"` // "codespace" (default) or "local"
 }
 
 // MatchCondition specifies when a provisioner should run.
@@ -26,36 +26,51 @@ type MatchCondition struct {
 
 // Config is the top-level config file structure.
 type Config struct {
-	Provisioners []ConfigEntry `json:"provisioners"`
+	Builtins     map[string]bool `json:"builtins,omitempty"`
+	Provisioners []ConfigEntry   `json:"provisioners"`
 }
 
-// LoadConfig reads provisioner config from the default location.
-// Returns an empty list (not error) if no config file exists.
-func LoadConfig() ([]Provisioner, error) {
+// LoadSettings reads provisioner config from the default location.
+// Returns an empty config (not error) if no config file exists.
+func LoadSettings() (Config, error) {
 	path := defaultConfigPath()
-	return LoadConfigFrom(path)
+	return LoadSettingsFrom(path)
 }
 
-// LoadConfigFrom reads provisioner config from a specific path.
-func LoadConfigFrom(path string) ([]Provisioner, error) {
+// LoadSettingsFrom reads provisioner config from a specific path.
+func LoadSettingsFrom(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return Config{}, nil
 		}
-		return nil, fmt.Errorf("reading provisioner config: %w", err)
+		return Config{}, fmt.Errorf("reading provisioner config: %w", err)
 	}
 
 	var config Config
 	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("parsing provisioner config: %w", err)
+		return Config{}, fmt.Errorf("parsing provisioner config: %w", err)
 	}
+	return config, nil
+}
 
-	var result []Provisioner
-	for _, entry := range config.Provisioners {
-		result = append(result, &configProvisioner{entry: entry})
+// LoadConfig reads user-defined provisioners from the default location.
+// Returns an empty list (not error) if no config file exists.
+func LoadConfig() ([]Provisioner, error) {
+	config, err := LoadSettings()
+	if err != nil {
+		return nil, err
 	}
-	return result, nil
+	return ProvisionersFromConfig(config), nil
+}
+
+// LoadConfigFrom reads user-defined provisioners from a specific path.
+func LoadConfigFrom(path string) ([]Provisioner, error) {
+	config, err := LoadSettingsFrom(path)
+	if err != nil {
+		return nil, err
+	}
+	return ProvisionersFromConfig(config), nil
 }
 
 func defaultConfigPath() string {
@@ -65,6 +80,15 @@ func defaultConfigPath() string {
 		configDir = filepath.Join(home, ".config")
 	}
 	return filepath.Join(configDir, "copilot-codespace", "provisioners.json")
+}
+
+// ProvisionersFromConfig builds provisioners from parsed config entries.
+func ProvisionersFromConfig(config Config) []Provisioner {
+	var result []Provisioner
+	for _, entry := range config.Provisioners {
+		result = append(result, &configProvisioner{entry: entry})
+	}
+	return result
 }
 
 // configProvisioner wraps a ConfigEntry as a Provisioner.

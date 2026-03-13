@@ -2,13 +2,16 @@ package provisioner
 
 import (
 	"context"
+	"os"
 	"testing"
 )
 
 type mockCSInfo struct {
-	name       string
-	repository string
-	workdir    string
+	name             string
+	repository       string
+	workdir          string
+	uploadedTerminfo []string
+	uploadErr        error
 }
 
 func (m *mockCSInfo) CodespaceName() string { return m.name }
@@ -17,29 +20,96 @@ func (m *mockCSInfo) Workdir() string       { return m.workdir }
 func (m *mockCSInfo) RunSSH(_ context.Context, _ string) (string, error) {
 	return "", nil
 }
+func (m *mockCSInfo) UploadTerminfo(_ context.Context, term string) error {
+	m.uploadedTerminfo = append(m.uploadedTerminfo, term)
+	return m.uploadErr
+}
 
-func TestTerminfoProvisioner_ShouldRun_GhosttyDetected(t *testing.T) {
+func TestTerminfoProvisioner_ShouldRun_GhosttySessionWithOverriddenTERM(t *testing.T) {
 	p := &TerminfoProvisioner{}
-	t.Setenv("TERM", "xterm-ghostty")
+	t.Setenv("TERM", "xterm-color")
+	t.Setenv("TERM_PROGRAM", "ghostty")
+	t.Setenv("GHOSTTY_RESOURCES_DIR", "/tmp/ghostty")
 
-	if !p.ShouldRun(RunContext{Terminal: "xterm-ghostty"}) {
-		t.Error("should run when TERM is xterm-ghostty")
+	if !p.ShouldRun(RunContext{Terminal: DetectedTerminal(os.Getenv("TERM"))}) {
+		t.Error("should run when Ghostty is the terminal program")
 	}
 }
 
-func TestTerminfoProvisioner_ShouldRun_NonGhostty(t *testing.T) {
+func TestTerminfoProvisioner_ShouldRun_StandardTerminalWithoutGhostty(t *testing.T) {
 	p := &TerminfoProvisioner{}
+	t.Setenv("TERM", "xterm-color")
+	t.Setenv("TERM_PROGRAM", "")
+	t.Setenv("GHOSTTY_RESOURCES_DIR", "")
 
-	if p.ShouldRun(RunContext{Terminal: "xterm-256color"}) {
+	if p.ShouldRun(RunContext{Terminal: DetectedTerminal(os.Getenv("TERM"))}) {
 		t.Error("should not run for standard terminal")
 	}
 }
 
 func TestTerminfoProvisioner_ShouldRun_Empty(t *testing.T) {
 	p := &TerminfoProvisioner{}
+	t.Setenv("TERM", "xterm-color")
+	t.Setenv("TERM_PROGRAM", "")
+	t.Setenv("GHOSTTY_RESOURCES_DIR", "")
 
-	if p.ShouldRun(RunContext{Terminal: ""}) {
+	if p.ShouldRun(RunContext{Terminal: DetectedTerminal("")}) {
 		t.Error("should not run when terminal is empty")
+	}
+}
+
+func TestDetectedTerminal_GhosttyNormalizesToXtermGhostty(t *testing.T) {
+	t.Setenv("TERM", "xterm-color")
+	t.Setenv("TERM_PROGRAM", "ghostty")
+	t.Setenv("GHOSTTY_RESOURCES_DIR", "/tmp/ghostty")
+
+	if got := DetectedTerminal(os.Getenv("TERM")); got != "xterm-ghostty" {
+		t.Fatalf("DetectedTerminal() = %q, want %q", got, "xterm-ghostty")
+	}
+}
+
+func TestTerminfoProvisioner_Run_UploadsGhosttyTerminfoWhenTERMOverridden(t *testing.T) {
+	p := &TerminfoProvisioner{}
+	target := &mockCSInfo{}
+	t.Setenv("TERM", "xterm-color")
+	t.Setenv("TERM_PROGRAM", "ghostty")
+	t.Setenv("GHOSTTY_RESOURCES_DIR", "/tmp/ghostty")
+
+	if err := p.Run(context.Background(), target); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got, want := target.uploadedTerminfo, []string{"xterm-ghostty"}; !equalStrings(got, want) {
+		t.Fatalf("uploadedTerminfo = %v, want %v", got, want)
+	}
+}
+
+func TestTerminfoProvisioner_Run_UploadsCurrentNonStandardTerm(t *testing.T) {
+	p := &TerminfoProvisioner{}
+	target := &mockCSInfo{}
+	t.Setenv("TERM", "wezterm")
+	t.Setenv("TERM_PROGRAM", "")
+	t.Setenv("GHOSTTY_RESOURCES_DIR", "")
+
+	if err := p.Run(context.Background(), target); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got, want := target.uploadedTerminfo, []string{"wezterm"}; !equalStrings(got, want) {
+		t.Fatalf("uploadedTerminfo = %v, want %v", got, want)
+	}
+}
+
+func TestTerminfoProvisioner_Run_DedupesGhosttyTerminfo(t *testing.T) {
+	p := &TerminfoProvisioner{}
+	target := &mockCSInfo{}
+	t.Setenv("TERM", "xterm-ghostty")
+	t.Setenv("TERM_PROGRAM", "ghostty")
+	t.Setenv("GHOSTTY_RESOURCES_DIR", "/tmp/ghostty")
+
+	if err := p.Run(context.Background(), target); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got, want := target.uploadedTerminfo, []string{"xterm-ghostty"}; !equalStrings(got, want) {
+		t.Fatalf("uploadedTerminfo = %v, want %v", got, want)
 	}
 }
 
@@ -125,11 +195,23 @@ type testProvisioner struct {
 	runFunc   func() error
 }
 
-func (p *testProvisioner) Name() string              { return p.name }
+func (p *testProvisioner) Name() string                { return p.name }
 func (p *testProvisioner) ShouldRun(_ RunContext) bool { return p.shouldRun }
 func (p *testProvisioner) Run(_ context.Context, _ CodespaceTarget) error {
 	if p.runFunc != nil {
 		return p.runFunc()
 	}
 	return nil
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }

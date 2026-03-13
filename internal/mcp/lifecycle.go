@@ -366,7 +366,7 @@ func createCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSta
 		if len(state.cfg.Provisioners) > 0 {
 			target := &csTarget{name: csName, repo: repo, workdir: workdir, client: sshClient}
 			rctx := provisioner.RunContext{
-				Terminal:       os.Getenv("TERM"),
+				Terminal:       provisioner.DetectedTerminal(os.Getenv("TERM")),
 				Repository:     repo,
 				IsNewCodespace: true,
 			}
@@ -512,7 +512,7 @@ func connectCodespaceHandlerWithState(reg *registry.Registry, state *lifecycleSt
 		if len(state.cfg.Provisioners) > 0 {
 			target := &csTarget{name: csName, repo: repoInfo, workdir: workdir, client: sshClient}
 			rctx := provisioner.RunContext{
-				Terminal:       os.Getenv("TERM"),
+				Terminal:       provisioner.DetectedTerminal(os.Getenv("TERM")),
 				Repository:     repoInfo,
 				IsNewCodespace: false,
 			}
@@ -657,6 +657,10 @@ func (t *csTarget) RunSSH(ctx context.Context, command string) (string, error) {
 		return stdout, fmt.Errorf("exit %d: %s", exitCode, strings.TrimSpace(stderr))
 	}
 	return stdout, nil
+}
+
+func (t *csTarget) UploadTerminfo(ctx context.Context, term string) error {
+	return t.client.UploadTerminfo(ctx, term)
 }
 
 // extractURL finds the first https://github.com/... URL in a string.

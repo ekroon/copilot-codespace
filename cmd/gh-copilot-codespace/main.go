@@ -104,6 +104,7 @@ func runMCPServer() {
 		fmt.Fprintf(os.Stderr, "codespace-mcp: invalid %s: %v\n", codespaceLifecycleConfigEnv, err)
 		os.Exit(1)
 	}
+	lifecycleCfg.Provisioners = loadProvisioners()
 
 	var reg *registry.Registry
 	if registryJSON != "" {
@@ -371,6 +372,7 @@ func runLauncher(args []string) error {
 
 	ctx := context.Background()
 	reg := registry.New()
+	provisioners := loadProvisioners()
 	var firstSSHClient *ssh.Client
 	var firstWorkdir, firstRemoteBinary string
 	var instructionsDir string
@@ -426,6 +428,7 @@ func runLauncher(args []string) error {
 		}); err != nil {
 			return fmt.Errorf("registering selected codespace %q: %w", selected.Name, err)
 		}
+		runProvisioners(ctx, provisioners, selected.Name, selected.Repository, workdir, sshClient, false)
 
 		if firstSSHClient == nil {
 			firstSSHClient = sshClient
@@ -1581,6 +1584,7 @@ func runResume(sessionName string, copilotArgs []string) error {
 	ctx := context.Background()
 	reg := registry.New()
 	hadCodespaces := len(ws.Manifest.Codespaces) > 0
+	provisioners := loadProvisioners()
 
 	for alias, entry := range ws.Manifest.Codespaces {
 		fmt.Printf("  Reconnecting %s (%s)...\n", alias, entry.Name)
@@ -1608,6 +1612,7 @@ func runResume(sessionName string, copilotArgs []string) error {
 		}); err != nil {
 			return fmt.Errorf("registering resumed codespace %q: %w", entry.Name, err)
 		}
+		runProvisioners(ctx, provisioners, entry.Name, entry.Repository, entry.Workdir, sshClient, false)
 		fmt.Printf("  ✓ %s connected\n", alias)
 	}
 
