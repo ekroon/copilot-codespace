@@ -44,7 +44,7 @@ Flags:
       --selected-only     Restrict existing-codespace connections to codespaces selected at startup
   -w, --workdir PATH     Override workspace directory on the codespace
       --name SESSION     Name for the local workspace session
-      --resume SESSION   Re-attach to a previous workspace session
+      --resume [SESSION] Re-attach to a previous workspace session, or choose one interactively
       --local-tools      Keep all local tools (bash, grep, glob) enabled alongside remote_* tools
 
 Subcommands:
@@ -251,14 +251,15 @@ func registryFromEntries(ctx context.Context, entries []registryEntry, build fun
 }
 
 type launcherOptions struct {
-	codespaceNames  []string
-	noCodespace     bool
-	selectedOnly    bool
-	workdirOverride string
-	sessionName     string
-	resumeSession   string
-	localTools      bool
-	copilotArgs     []string
+	codespaceNames    []string
+	noCodespace       bool
+	selectedOnly      bool
+	workdirOverride   string
+	sessionName       string
+	resumeSession     string
+	resumeInteractive bool
+	localTools        bool
+	copilotArgs       []string
 }
 
 func parseLauncherArgs(args []string) (launcherOptions, error) {
@@ -286,9 +287,13 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 		case args[i] == "--name" && i+1 < len(args):
 			opts.sessionName = args[i+1]
 			i++
-		case args[i] == "--resume" && i+1 < len(args):
-			opts.resumeSession = args[i+1]
-			i++
+		case args[i] == "--resume":
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				opts.resumeSession = args[i+1]
+				i++
+			} else {
+				opts.resumeInteractive = true
+			}
 		default:
 			opts.copilotArgs = append(opts.copilotArgs, args[i])
 		}
@@ -297,7 +302,7 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 	if opts.noCodespace && len(opts.codespaceNames) > 0 {
 		return launcherOptions{}, fmt.Errorf("--no-codespace and --codespace are mutually exclusive")
 	}
-	if opts.noCodespace && opts.resumeSession != "" {
+	if opts.noCodespace && (opts.resumeSession != "" || opts.resumeInteractive) {
 		return launcherOptions{}, fmt.Errorf("--no-codespace and --resume are mutually exclusive")
 	}
 
@@ -335,8 +340,15 @@ func runLauncher(args []string) error {
 	}
 
 	// Handle --resume: load workspace and reconnect to codespaces
-	if opts.resumeSession != "" {
-		return runResume(opts.resumeSession, opts.copilotArgs)
+	if opts.resumeSession != "" || opts.resumeInteractive {
+		sessionName := opts.resumeSession
+		if sessionName == "" {
+			sessionName, err = selectResumeSession()
+			if err != nil {
+				return err
+			}
+		}
+		return runResume(sessionName, opts.copilotArgs)
 	}
 
 	// The binary serves as both launcher and MCP server
@@ -699,6 +711,77 @@ func parseSelectionIndices(input string, max int) ([]int, error) {
 		selected = append(selected, idx)
 	}
 	return selected, nil
+}
+
+func selectResumeSession() (string, error) {
+	list, err := workspace.List()
+	if err != nil {
+		return "", err
+	}
+	return selectWorkspaceSession(list)
+}
+
+func selectWorkspaceSession(list []workspace.WorkspaceSummary) (string, error) {
+	if len(list) == 0 {
+		return "", fmt.Errorf("no workspace sessions found")
+	}
+	if len(list) == 1 {
+		return list[0].Name, nil
+	}
+
+	lines := make([]string, len(list))
+	byChoice := make(map[string]workspace.WorkspaceSummary, len(list))
+	for i, ws := range list {
+		line := formatWorkspaceSummary(ws)
+		lines[i] = line
+		byChoice[line] = ws
+	}
+
+	if gumPath, err := exec.LookPath("gum"); err == nil {
+		cmd := exec.Command(gumPath, "choose", "--header", "Choose workspace session to resume")
+		cmd.Stdin = strings.NewReader(strings.Join(lines, "\n"))
+		cmd.Stderr = os.Stderr
+		selected, err := cmd.Output()
+		if err == nil {
+			choice := strings.TrimSpace(string(selected))
+			if ws, ok := byChoice[choice]; ok {
+				return ws.Name, nil
+			}
+			if choice == "" {
+				return "", fmt.Errorf("no workspace session selected")
+			}
+		}
+	}
+
+	fmt.Println("Available workspace sessions:")
+	for i, line := range lines {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) == 2 {
+			fmt.Printf("  %2d) %s\n", i+1, parts[1])
+			continue
+		}
+		fmt.Printf("  %2d) %s\n", i+1, line)
+	}
+
+	fmt.Printf("\nSelect [1-%d]: ", len(list))
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("reading input: %w", err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(input))
+	if err != nil || n < 1 || n > len(list) {
+		return "", fmt.Errorf("invalid selection")
+	}
+	return list[n-1].Name, nil
+}
+
+func formatWorkspaceSummary(ws workspace.WorkspaceSummary) string {
+	label := "codespaces"
+	if ws.CodespaceCount == 1 {
+		label = "codespace"
+	}
+	return fmt.Sprintf("%s\tcreated %s · %d %s", ws.Name, ws.Created.Format("2006-01-02 15:04"), ws.CodespaceCount, label)
 }
 
 func startCodespace(name string) error {
@@ -1720,7 +1803,8 @@ func runWorkspaces(args []string) error {
 	for _, ws := range list {
 		fmt.Printf("%-30s %-20s %d\n", ws.Name, ws.Created.Format("2006-01-02 15:04"), ws.CodespaceCount)
 	}
-	fmt.Printf("\nResume with: gh copilot-codespace --resume <name>\n")
+	fmt.Printf("\nResume with: gh copilot-codespace --resume\n")
+	fmt.Printf("         or: gh copilot-codespace --resume <name>\n")
 	fmt.Printf("Delete with: gh copilot-codespace workspaces --delete <name>\n")
 	return nil
 }

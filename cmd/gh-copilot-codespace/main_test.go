@@ -8,10 +8,12 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ekroon/gh-copilot-codespace/internal/mcp"
 	"github.com/ekroon/gh-copilot-codespace/internal/registry"
 	"github.com/ekroon/gh-copilot-codespace/internal/ssh"
+	"github.com/ekroon/gh-copilot-codespace/internal/workspace"
 )
 
 func TestBuildMCPConfig(t *testing.T) {
@@ -550,9 +552,37 @@ func TestParseLauncherArgs(t *testing.T) {
 			},
 		},
 		{
+			name: "explicit resume session consumes following value",
+			args: []string{"--resume", "saved-session", "--model", "claude-sonnet-4.5"},
+			want: launcherOptions{
+				resumeSession: "saved-session",
+				copilotArgs:   []string{"--model", "claude-sonnet-4.5"},
+			},
+		},
+		{
+			name: "bare resume enables interactive picker mode",
+			args: []string{"--resume"},
+			want: launcherOptions{
+				resumeInteractive: true,
+			},
+		},
+		{
+			name: "bare resume before another flag keeps later args intact",
+			args: []string{"--resume", "--model", "claude-sonnet-4.5"},
+			want: launcherOptions{
+				resumeInteractive: true,
+				copilotArgs:       []string{"--model", "claude-sonnet-4.5"},
+			},
+		},
+		{
 			name:    "no-codespace conflicts with explicit codespace",
 			args:    []string{"--no-codespace", "--codespace", "cs-1"},
 			wantErr: "--no-codespace and --codespace are mutually exclusive",
+		},
+		{
+			name:    "no-codespace conflicts with bare resume",
+			args:    []string{"--no-codespace", "--resume"},
+			wantErr: "--no-codespace and --resume are mutually exclusive",
 		},
 		{
 			name:    "no-codespace conflicts with resume",
@@ -581,6 +611,72 @@ func TestParseLauncherArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSelectWorkspaceSession(t *testing.T) {
+	t.Run("no saved sessions returns error", func(t *testing.T) {
+		_, err := selectWorkspaceSession(nil)
+		if err == nil || err.Error() != "no workspace sessions found" {
+			t.Fatalf("got err %v, want no workspace sessions found", err)
+		}
+	})
+
+	t.Run("single saved session returns immediately", func(t *testing.T) {
+		got, err := selectWorkspaceSession([]workspace.WorkspaceSummary{
+			{Name: "only-session"},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "only-session" {
+			t.Fatalf("got %q, want %q", got, "only-session")
+		}
+	})
+
+	t.Run("numbered fallback selects requested session", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+
+		stdinFile := writeTempInputFile(t, "2\n")
+		originalStdin := os.Stdin
+		os.Stdin = stdinFile
+		defer func() { os.Stdin = originalStdin }()
+
+		got, err := selectWorkspaceSession([]workspace.WorkspaceSummary{
+			{Name: "first", Created: mustParseTime(t, "2026-03-17 09:00"), CodespaceCount: 1},
+			{Name: "second", Created: mustParseTime(t, "2026-03-18 10:30"), CodespaceCount: 2},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "second" {
+			t.Fatalf("got %q, want %q", got, "second")
+		}
+	})
+}
+
+func writeTempInputFile(t *testing.T, input string) *os.File {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "stdin.txt")
+	if err := os.WriteFile(path, []byte(input), 0o644); err != nil {
+		t.Fatalf("write stdin file: %v", err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open stdin file: %v", err)
+	}
+	t.Cleanup(func() { file.Close() })
+	return file
+}
+
+func mustParseTime(t *testing.T, value string) time.Time {
+	t.Helper()
+
+	parsed, err := time.Parse("2006-01-02 15:04", value)
+	if err != nil {
+		t.Fatalf("parse time %q: %v", value, err)
+	}
+	return parsed
 }
 
 func TestResolveSelectedCodespaces(t *testing.T) {

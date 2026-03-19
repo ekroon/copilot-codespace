@@ -65,8 +65,11 @@ gh copilot-codespace --no-codespace --selected-only --name restricted-bootstrap
 # Name the session for later resume
 gh copilot-codespace --name my-session
 
-# Resume a previous session
+# Resume a previous session by name
 gh copilot-codespace --resume my-session
+
+# Resume by choosing from saved sessions
+gh copilot-codespace --resume
 
 # List workspace sessions
 gh copilot-codespace workspaces
@@ -120,14 +123,17 @@ The agent can also create, connect to, and delete codespaces on the fly using `c
 
 ## Session resume
 
-Workspace sessions are saved to `~/.copilot/workspaces/` with a manifest (`workspace.json`) tracking connected codespaces. Empty sessions are resumable too, which is useful when you want to launch first and create/connect codespaces later from the agent. Use `--resume` to reconnect:
+Workspace sessions are saved to `~/.copilot/workspaces/` with a manifest (`workspace.json`) tracking connected codespaces. Empty sessions are resumable too, which is useful when you want to launch first and create/connect codespaces later from the agent. Use `--resume` to reconnect by name, or pass bare `--resume` to choose interactively from saved sessions:
 
 ```bash
 # First session
 gh copilot-codespace --name my-feature -c my-codespace
 
-# Later: resume
+# Later: resume by name
 gh copilot-codespace --resume my-feature
+
+# Or choose from saved sessions
+gh copilot-codespace --resume
 ```
 
 Local files created in the workspace `files/` directory persist across sessions.
