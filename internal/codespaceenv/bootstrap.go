@@ -30,7 +30,7 @@ func BuildShellBootstrapFromPath(path string) string {
 	quotedDotComAPIURL := shellQuote(dotComGitHubAPIURL)
 
 	return fmt.Sprintf(`if [ -f %[1]s ]; then
-while IFS= read -r line; do
+while IFS= read -r line || [ -n "$line" ]; do
 key="$(printf '%%s' "$line" | sed 's/=.*//')"
 value="$(printf '%%s' "$line" | sed 's/^[^=]*=//')"
 if [ -n "$key" ]; then

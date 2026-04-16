@@ -25,8 +25,20 @@ type Workspace struct {
 type Manifest struct {
 	Created               time.Time                 `json:"created"`
 	Codespaces            map[string]CodespaceEntry `json:"codespaces"`
+	Settings              SessionSettings           `json:"settings,omitempty"`
 	SelectedOnly          bool                      `json:"selectedOnly,omitempty"`
 	AllowedCodespaceNames []string                  `json:"allowedCodespaceNames,omitempty"`
+}
+
+// SessionSettings are persisted session-level launcher defaults that should
+// survive resume.
+type SessionSettings struct {
+	LocalTools bool `json:"localTools,omitempty"`
+}
+
+// IsZero allows json omitempty to drop empty settings blocks.
+func (s SessionSettings) IsZero() bool {
+	return !s.LocalTools
 }
 
 // SetAccessPolicy updates the persisted access policy fields.

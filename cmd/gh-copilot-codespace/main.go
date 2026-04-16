@@ -44,11 +44,13 @@ Run Copilot CLI against remote GitHub Codespace(s) via SSH.
 Flags:
   -c, --codespace NAME   Use a specific codespace (repeatable, or comma-separated)
       --no-codespace     Start without connecting to any codespace (skip picker)
-      --selected-only     Restrict existing-codespace connections to codespaces selected at startup
+      --selected-only[=BOOL]
+                         Restrict existing-codespace connections to codespaces selected at startup
   -w, --workdir PATH     Override workspace directory on the codespace
       --name SESSION     Name for the local workspace session
       --resume [SESSION] Re-attach to a previous workspace session, or choose one interactively
-      --local-tools      Keep all local tools (bash, grep, glob) enabled alongside remote_* tools
+      --local-tools[=BOOL]
+                         Keep all local tools (bash, grep, glob) enabled alongside remote_* tools
 
 Subcommands:
   mcp                    Run as MCP server (used internally by Copilot)
@@ -256,25 +258,73 @@ func registryFromEntries(ctx context.Context, entries []registryEntry, build fun
 type launcherOptions struct {
 	codespaceNames    []string
 	noCodespace       bool
-	selectedOnly      bool
+	selectedOnly      optionalBool
 	workdirOverride   string
 	sessionName       string
 	resumeSession     string
 	resumeInteractive bool
-	localTools        bool
+	localTools        optionalBool
 	copilotArgs       []string
+}
+
+type optionalBool struct {
+	set   bool
+	value bool
+}
+
+func (b optionalBool) resolve(defaultValue bool) bool {
+	if !b.set {
+		return defaultValue
+	}
+	return b.value
+}
+
+type resumeConfig struct {
+	sessionName  string
+	localTools   optionalBool
+	selectedOnly optionalBool
+	copilotArgs  []string
+}
+
+type resolvedResumeConfig struct {
+	localTools   bool
+	accessPolicy mcp.CodespaceAccessPolicy
+}
+
+func parseOptionalBoolFlag(arg string, flagName string) (optionalBool, bool, error) {
+	if arg == flagName {
+		return optionalBool{set: true, value: true}, true, nil
+	}
+	prefix := flagName + "="
+	if !strings.HasPrefix(arg, prefix) {
+		return optionalBool{}, false, nil
+	}
+	value, err := strconv.ParseBool(strings.TrimSpace(arg[len(prefix):]))
+	if err != nil {
+		return optionalBool{}, true, fmt.Errorf("parsing %s: invalid boolean value %q", flagName, arg[len(prefix):])
+	}
+	return optionalBool{set: true, value: value}, true, nil
 }
 
 func parseLauncherArgs(args []string) (launcherOptions, error) {
 	var opts launcherOptions
 	for i := 0; i < len(args); i++ {
+		if parsed, ok, err := parseOptionalBoolFlag(args[i], "--local-tools"); err != nil {
+			return launcherOptions{}, err
+		} else if ok {
+			opts.localTools = parsed
+			continue
+		}
+		if parsed, ok, err := parseOptionalBoolFlag(args[i], "--selected-only"); err != nil {
+			return launcherOptions{}, err
+		} else if ok {
+			opts.selectedOnly = parsed
+			continue
+		}
+
 		switch {
-		case args[i] == "--local-tools":
-			opts.localTools = true
 		case args[i] == "--no-codespace":
 			opts.noCodespace = true
-		case args[i] == "--selected-only":
-			opts.selectedOnly = true
 		case (args[i] == "--codespace" || args[i] == "-c") && i+1 < len(args):
 			// Support comma-separated: -c cs1,cs2
 			for _, name := range strings.Split(args[i+1], ",") {
@@ -308,8 +358,62 @@ func parseLauncherArgs(args []string) (launcherOptions, error) {
 	if opts.noCodespace && (opts.resumeSession != "" || opts.resumeInteractive) {
 		return launcherOptions{}, fmt.Errorf("--no-codespace and --resume are mutually exclusive")
 	}
+	if opts.resumeSession != "" || opts.resumeInteractive {
+		switch {
+		case len(opts.codespaceNames) > 0:
+			return launcherOptions{}, fmt.Errorf("--codespace and --resume are mutually exclusive")
+		case opts.workdirOverride != "":
+			return launcherOptions{}, fmt.Errorf("--workdir and --resume are mutually exclusive")
+		case opts.sessionName != "":
+			return launcherOptions{}, fmt.Errorf("--name and --resume are mutually exclusive")
+		}
+	}
 
 	return opts, nil
+}
+
+func newResumeConfig(opts launcherOptions) (resumeConfig, error) {
+	if opts.resumeSession == "" && !opts.resumeInteractive {
+		return resumeConfig{}, fmt.Errorf("resume config requires --resume")
+	}
+	if len(opts.codespaceNames) > 0 {
+		return resumeConfig{}, fmt.Errorf("--codespace and --resume are mutually exclusive")
+	}
+	if opts.noCodespace {
+		return resumeConfig{}, fmt.Errorf("--no-codespace and --resume are mutually exclusive")
+	}
+	if opts.workdirOverride != "" {
+		return resumeConfig{}, fmt.Errorf("--workdir and --resume are mutually exclusive")
+	}
+	if opts.sessionName != "" {
+		return resumeConfig{}, fmt.Errorf("--name and --resume are mutually exclusive")
+	}
+
+	return resumeConfig{
+		sessionName:  opts.resumeSession,
+		localTools:   opts.localTools,
+		selectedOnly: opts.selectedOnly,
+		copilotArgs:  append([]string(nil), opts.copilotArgs...),
+	}, nil
+}
+
+func resolveResumeConfig(manifest *workspace.Manifest, cfg resumeConfig) resolvedResumeConfig {
+	var stored workspace.SessionSettings
+	var allowedCodespaceNames []string
+	var selectedOnly bool
+	if manifest != nil {
+		stored = manifest.Settings
+		selectedOnly = manifest.SelectedOnly
+		allowedCodespaceNames = append([]string(nil), manifest.AllowedCodespaceNames...)
+	}
+
+	return resolvedResumeConfig{
+		localTools: cfg.localTools.resolve(stored.LocalTools),
+		accessPolicy: mcp.CodespaceAccessPolicy{
+			SelectedOnly:          cfg.selectedOnly.resolve(selectedOnly),
+			AllowedCodespaceNames: uniqueStrings(allowedCodespaceNames),
+		},
+	}
 }
 
 func selectedCodespaceNames(selected []codespace) []string {
@@ -344,14 +448,17 @@ func runLauncher(args []string) error {
 
 	// Handle --resume: load workspace and reconnect to codespaces
 	if opts.resumeSession != "" || opts.resumeInteractive {
-		sessionName := opts.resumeSession
-		if sessionName == "" {
-			sessionName, err = selectResumeSession()
+		resumeCfg, err := newResumeConfig(opts)
+		if err != nil {
+			return err
+		}
+		if resumeCfg.sessionName == "" {
+			resumeCfg.sessionName, err = selectResumeSession()
 			if err != nil {
 				return err
 			}
 		}
-		return runResume(sessionName, opts.copilotArgs)
+		return runResume(resumeCfg)
 	}
 
 	// The binary serves as both launcher and MCP server
@@ -378,7 +485,7 @@ func runLauncher(args []string) error {
 	}
 
 	lifecycleCfg := mcp.LifecycleConfig{}
-	if opts.selectedOnly {
+	if opts.selectedOnly.resolve(false) {
 		lifecycleCfg.AccessPolicy = mcp.CodespaceAccessPolicy{
 			SelectedOnly:          true,
 			AllowedCodespaceNames: selectedCodespaceNames(selectedList),
@@ -485,6 +592,7 @@ func runLauncher(args []string) error {
 			Name: ws.Name,
 			Dir:  ws.Dir,
 		}
+		ws.Manifest.Settings.LocalTools = opts.localTools.resolve(false)
 		ws.Manifest.SelectedOnly = lifecycleCfg.AccessPolicy.SelectedOnly
 		ws.Manifest.AllowedCodespaceNames = append([]string(nil), lifecycleCfg.AccessPolicy.AllowedCodespaceNames...)
 	}
@@ -519,13 +627,7 @@ func runLauncher(args []string) error {
 	mcpConfig := buildMCPConfigWithRegistry(self, reg, allRemoteMCPServers, lifecycleCfg)
 
 	// Excluded tools
-	var excludedTools []string
-	if !opts.localTools {
-		excludedTools = []string{
-			"bash", "write_bash", "read_bash",
-			"stop_bash", "list_bash", "grep", "glob",
-		}
-	}
+	excludedTools := launcherExcludedTools(opts.localTools.resolve(false))
 
 	// Forward IDE connections from all connected codespaces
 	for _, cs := range reg.All() {
@@ -1663,12 +1765,7 @@ func shellQuote(s string) string {
 }
 
 func execCopilot(excludedTools []string, mcpConfig string, extraArgs []string) error {
-	copilotArgs := []string{
-		"--excluded-tools",
-	}
-	copilotArgs = append(copilotArgs, excludedTools...)
-	copilotArgs = append(copilotArgs, "--additional-mcp-config", mcpConfig)
-	copilotArgs = append(copilotArgs, extraArgs...)
+	copilotArgs := buildCopilotArgs(excludedTools, mcpConfig, extraArgs)
 
 	// Try standalone copilot binary first
 	if copilotPath, err := exec.LookPath("copilot"); err == nil {
@@ -1685,6 +1782,27 @@ func execCopilot(excludedTools []string, mcpConfig string, extraArgs []string) e
 	// Use "--" so gh doesn't interpret copilot's flags
 	args := append([]string{"gh", "copilot", "--"}, copilotArgs...)
 	return syscall.Exec(ghPath, args, os.Environ())
+}
+
+func launcherExcludedTools(localTools bool) []string {
+	if localTools {
+		return nil
+	}
+	return []string{
+		"bash", "write_bash", "read_bash",
+		"stop_bash", "list_bash", "grep", "glob",
+	}
+}
+
+func buildCopilotArgs(excludedTools []string, mcpConfig string, extraArgs []string) []string {
+	copilotArgs := make([]string, 0, len(excludedTools)+len(extraArgs)+4)
+	if len(excludedTools) > 0 {
+		copilotArgs = append(copilotArgs, "--excluded-tools")
+		copilotArgs = append(copilotArgs, excludedTools...)
+	}
+	copilotArgs = append(copilotArgs, "--additional-mcp-config", mcpConfig)
+	copilotArgs = append(copilotArgs, extraArgs...)
+	return copilotArgs
 }
 
 // detectRemoteBranch reads the current git branch from the codespace via SSH.
@@ -1786,13 +1904,16 @@ Use these remote tools to explore the codespace:
 }
 
 // runResume loads a workspace session and reconnects to its codespaces.
-func runResume(sessionName string, copilotArgs []string) error {
-	ws, err := workspace.Load(sessionName)
+func runResume(cfg resumeConfig) error {
+	ws, err := workspace.Load(cfg.sessionName)
 	if err != nil {
-		return fmt.Errorf("loading workspace %q: %w", sessionName, err)
+		return fmt.Errorf("loading workspace %q: %w", cfg.sessionName, err)
 	}
+	resolvedCfg := resolveResumeConfig(ws.Manifest, cfg)
+	ws.Manifest.Settings.LocalTools = resolvedCfg.localTools
+	ws.Manifest.SetAccessPolicy(resolvedCfg.accessPolicy.SelectedOnly, resolvedCfg.accessPolicy.AllowedCodespaceNames)
 
-	fmt.Printf("Resuming workspace %q...\n", sessionName)
+	fmt.Printf("Resuming workspace %q...\n", cfg.sessionName)
 
 	self, err := os.Executable()
 	if err != nil {
@@ -1854,8 +1975,8 @@ func runResume(sessionName string, copilotArgs []string) error {
 		}
 	} else {
 		writeZeroCodespaceInstructionsPreamble(instructionsDir, mcp.CodespaceAccessPolicy{
-			SelectedOnly:          ws.Manifest.SelectedOnly,
-			AllowedCodespaceNames: append([]string(nil), ws.Manifest.AllowedCodespaceNames...),
+			SelectedOnly:          resolvedCfg.accessPolicy.SelectedOnly,
+			AllowedCodespaceNames: append([]string(nil), resolvedCfg.accessPolicy.AllowedCodespaceNames...),
 		})
 	}
 
@@ -1870,10 +1991,7 @@ func runResume(sessionName string, copilotArgs []string) error {
 	}
 
 	lifecycleCfg := mcp.LifecycleConfig{
-		AccessPolicy: mcp.CodespaceAccessPolicy{
-			SelectedOnly:          ws.Manifest.SelectedOnly,
-			AllowedCodespaceNames: uniqueStrings(ws.Manifest.AllowedCodespaceNames),
-		},
+		AccessPolicy: resolvedCfg.accessPolicy,
 		Workspace: mcp.WorkspaceSessionContext{
 			Name: ws.Name,
 			Dir:  ws.Dir,
@@ -1886,10 +2004,7 @@ func runResume(sessionName string, copilotArgs []string) error {
 
 	mcpConfig := buildMCPConfigWithRegistry(self, reg, nil, lifecycleCfg)
 
-	excludedTools := []string{
-		"bash", "write_bash", "read_bash",
-		"stop_bash", "list_bash", "grep", "glob",
-	}
+	excludedTools := launcherExcludedTools(resolvedCfg.localTools)
 
 	fmt.Printf("\nResuming with %d codespace(s)...\n", reg.Len())
 	if reg.Len() == 0 {
@@ -1900,7 +2015,7 @@ func runResume(sessionName string, copilotArgs []string) error {
 	}
 	fmt.Printf("\n")
 
-	return execCopilot(excludedTools, mcpConfig, copilotArgs)
+	return execCopilot(excludedTools, mcpConfig, cfg.copilotArgs)
 }
 
 // runWorkspaces lists or manages workspace sessions.

@@ -68,6 +68,9 @@ gh copilot-codespace --name my-session
 # Resume a previous session by name
 gh copilot-codespace --resume my-session
 
+# Resume and keep local bash/grep/glob tools enabled too
+gh copilot-codespace --resume my-session --local-tools
+
 # Resume by choosing from saved sessions
 gh copilot-codespace --resume
 
@@ -139,6 +142,16 @@ gh copilot-codespace --resume
 `gh copilot-codespace workspaces` now shows richer workspace metadata including repositories, codespace names, branches, the local workspace path, and recent activity time. The interactive `--resume` picker also includes that metadata in each entry so you can search on it directly.
 
 Local files created in the workspace `files/` directory persist across sessions.
+
+Workspace manifests also persist session behavior, including `--local-tools` and the selected-only access policy. Resume uses those saved settings by default.
+
+You can override persisted booleans on resume:
+
+- bare `--local-tools` / `--selected-only` still mean `true`
+- `--local-tools=true|false`
+- `--selected-only=true|false`
+
+Launch identity flags are still not valid with resume: `--codespace`, `--workdir`, and `--name` are creation-time inputs, while resume reuses the saved workspace session and its persisted codespace metadata.
 
 When `--selected-only` was enabled, resume preserves the allowlist too: the **existing** codespaces selected at startup stay eligible, and any codespaces created from inside that session stay eligible as well. Resuming does not reopen access to other pre-existing codespaces that were not selected at startup.
 

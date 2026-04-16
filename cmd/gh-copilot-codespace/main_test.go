@@ -19,6 +19,10 @@ import (
 	"github.com/ekroon/gh-copilot-codespace/internal/workspace"
 )
 
+func setBoolFlag(value bool) optionalBool {
+	return optionalBool{set: true, value: value}
+}
+
 func TestBuildMCPConfig(t *testing.T) {
 	result := buildMCPConfig("/usr/local/bin/self", "my-codespace", "/workspaces/repo", nil, "")
 
@@ -541,9 +545,9 @@ func TestParseLauncherArgs(t *testing.T) {
 			args: []string{"--selected-only", "--local-tools", "-w", "/workspaces/repo", "-c", "cs-1,cs-2", "--theme", "dark"},
 			want: launcherOptions{
 				codespaceNames:  []string{"cs-1", "cs-2"},
-				selectedOnly:    true,
+				selectedOnly:    setBoolFlag(true),
 				workdirOverride: "/workspaces/repo",
-				localTools:      true,
+				localTools:      setBoolFlag(true),
 				copilotArgs:     []string{"--theme", "dark"},
 			},
 		},
@@ -559,6 +563,33 @@ func TestParseLauncherArgs(t *testing.T) {
 			args: []string{"--resume", "saved-session", "--model", "claude-sonnet-4.5"},
 			want: launcherOptions{
 				resumeSession: "saved-session",
+				copilotArgs:   []string{"--model", "claude-sonnet-4.5"},
+			},
+		},
+		{
+			name: "resume keeps local tools and copilot args",
+			args: []string{"--resume", "saved-session", "--local-tools", "--model", "claude-sonnet-4.5"},
+			want: launcherOptions{
+				resumeSession: "saved-session",
+				localTools:    setBoolFlag(true),
+				copilotArgs:   []string{"--model", "claude-sonnet-4.5"},
+			},
+		},
+		{
+			name: "resume supports explicit false local tools override",
+			args: []string{"--resume", "saved-session", "--local-tools=false", "--model", "claude-sonnet-4.5"},
+			want: launcherOptions{
+				resumeSession: "saved-session",
+				localTools:    setBoolFlag(false),
+				copilotArgs:   []string{"--model", "claude-sonnet-4.5"},
+			},
+		},
+		{
+			name: "resume supports selected-only override values",
+			args: []string{"--resume", "saved-session", "--selected-only=false", "--model", "claude-sonnet-4.5"},
+			want: launcherOptions{
+				resumeSession: "saved-session",
+				selectedOnly:  setBoolFlag(false),
 				copilotArgs:   []string{"--model", "claude-sonnet-4.5"},
 			},
 		},
@@ -592,6 +623,21 @@ func TestParseLauncherArgs(t *testing.T) {
 			args:    []string{"--no-codespace", "--resume", "saved-session"},
 			wantErr: "--no-codespace and --resume are mutually exclusive",
 		},
+		{
+			name:    "resume conflicts with explicit codespace",
+			args:    []string{"--resume", "saved-session", "--codespace", "cs-1"},
+			wantErr: "--codespace and --resume are mutually exclusive",
+		},
+		{
+			name:    "resume conflicts with workdir",
+			args:    []string{"--resume", "saved-session", "--workdir", "/workspaces/repo"},
+			wantErr: "--workdir and --resume are mutually exclusive",
+		},
+		{
+			name:    "resume conflicts with name",
+			args:    []string{"--resume", "saved-session", "--name", "other-session"},
+			wantErr: "--name and --resume are mutually exclusive",
+		},
 	}
 
 	for _, tt := range tests {
@@ -611,6 +657,158 @@ func TestParseLauncherArgs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("got %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewResumeConfig(t *testing.T) {
+	cfg, err := newResumeConfig(launcherOptions{
+		resumeSession: "saved-session",
+		localTools:    setBoolFlag(true),
+		selectedOnly:  setBoolFlag(false),
+		copilotArgs:   []string{"--model", "claude-sonnet-4.5"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.sessionName != "saved-session" {
+		t.Fatalf("sessionName = %q, want saved-session", cfg.sessionName)
+	}
+	if !reflect.DeepEqual(cfg.localTools, setBoolFlag(true)) {
+		t.Fatalf("localTools = %+v, want true override", cfg.localTools)
+	}
+	if !reflect.DeepEqual(cfg.selectedOnly, setBoolFlag(false)) {
+		t.Fatalf("selectedOnly = %+v, want false override", cfg.selectedOnly)
+	}
+	if !reflect.DeepEqual(cfg.copilotArgs, []string{"--model", "claude-sonnet-4.5"}) {
+		t.Fatalf("copilotArgs = %v, want [--model claude-sonnet-4.5]", cfg.copilotArgs)
+	}
+}
+
+func TestResolveResumeConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  resumeConfig
+		ws   *workspace.Manifest
+		want resolvedResumeConfig
+	}{
+		{
+			name: "uses persisted defaults",
+			cfg:  resumeConfig{sessionName: "saved-session"},
+			ws: &workspace.Manifest{
+				SelectedOnly:          true,
+				AllowedCodespaceNames: []string{"cs-1"},
+				Settings: workspace.SessionSettings{
+					LocalTools: true,
+				},
+			},
+			want: resolvedResumeConfig{
+				localTools: true,
+				accessPolicy: mcp.CodespaceAccessPolicy{
+					SelectedOnly:          true,
+					AllowedCodespaceNames: []string{"cs-1"},
+				},
+			},
+		},
+		{
+			name: "explicit false overrides persisted true",
+			cfg: resumeConfig{
+				sessionName:  "saved-session",
+				localTools:   setBoolFlag(false),
+				selectedOnly: setBoolFlag(false),
+			},
+			ws: &workspace.Manifest{
+				SelectedOnly:          true,
+				AllowedCodespaceNames: []string{"cs-1"},
+				Settings: workspace.SessionSettings{
+					LocalTools: true,
+				},
+			},
+			want: resolvedResumeConfig{
+				localTools: false,
+				accessPolicy: mcp.CodespaceAccessPolicy{
+					SelectedOnly:          false,
+					AllowedCodespaceNames: []string{"cs-1"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveResumeConfig(tt.ws, tt.cfg)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("resolveResumeConfig() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLauncherExcludedTools(t *testing.T) {
+	tests := []struct {
+		name       string
+		localTools bool
+		want       []string
+	}{
+		{
+			name:       "default excludes local shell tools",
+			localTools: false,
+			want: []string{
+				"bash", "write_bash", "read_bash",
+				"stop_bash", "list_bash", "grep", "glob",
+			},
+		},
+		{
+			name:       "local tools enabled excludes nothing",
+			localTools: true,
+			want:       nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := launcherExcludedTools(tt.localTools); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("launcherExcludedTools(%v) = %v, want %v", tt.localTools, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildCopilotArgs(t *testing.T) {
+	tests := []struct {
+		name          string
+		excludedTools []string
+		extraArgs     []string
+		want          []string
+	}{
+		{
+			name:          "includes excluded tools when present",
+			excludedTools: []string{"bash", "grep"},
+			extraArgs:     []string{"--model", "claude-sonnet-4.5"},
+			want: []string{
+				"--excluded-tools", "bash", "grep",
+				"--additional-mcp-config", `{"mcpServers":{}}`,
+				"--model", "claude-sonnet-4.5",
+			},
+		},
+		{
+			name:          "omits excluded tools flag when none are excluded",
+			excludedTools: nil,
+			extraArgs:     []string{"--model", "claude-sonnet-4.5"},
+			want: []string{
+				"--additional-mcp-config", `{"mcpServers":{}}`,
+				"--model", "claude-sonnet-4.5",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildCopilotArgs(tt.excludedTools, `{"mcpServers":{}}`, tt.extraArgs)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("buildCopilotArgs() = %v, want %v", got, tt.want)
 			}
 		})
 	}

@@ -75,6 +75,7 @@ func TestLoadWorkspace(t *testing.T) {
 		Workdir:    "/workspaces/github",
 	})
 	ws.Manifest.SetAccessPolicy(true, []string{"cs-abc"})
+	ws.Manifest.Settings.LocalTools = true
 	if err := ws.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -84,6 +85,9 @@ func TestLoadWorkspace(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"selectedOnly": true`) {
 		t.Fatalf("expected workspace.json to persist selectedOnly, got %q", string(data))
+	}
+	if !strings.Contains(string(data), `"localTools": true`) {
+		t.Fatalf("expected workspace.json to persist localTools, got %q", string(data))
 	}
 
 	// Load it
@@ -107,6 +111,48 @@ func TestLoadWorkspace(t *testing.T) {
 	}
 	if !reflect.DeepEqual(loaded.Manifest.AllowedCodespaceNames, []string{"cs-abc"}) {
 		t.Errorf("allowed codespace names = %v, want [cs-abc]", loaded.Manifest.AllowedCodespaceNames)
+	}
+	if !loaded.Manifest.Settings.LocalTools {
+		t.Error("expected localTools to round trip")
+	}
+}
+
+func TestLoadWorkspace_BackwardCompatibleWithoutSettings(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	dir := WorkspacePath("legacy")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	legacy := `{
+  "created": "2026-03-30T18:00:00Z",
+  "codespaces": {
+    "github": {
+      "name": "cs-abc",
+      "repository": "github/github",
+      "branch": "main",
+      "workdir": "/workspaces/github"
+    }
+  },
+  "selectedOnly": true,
+  "allowedCodespaceNames": ["cs-abc"]
+}`
+	if err := os.WriteFile(filepath.Join(dir, "workspace.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	loaded, err := Load("legacy")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if loaded.Manifest.Settings.LocalTools {
+		t.Fatal("expected missing localTools setting to default false")
+	}
+	if !loaded.Manifest.SelectedOnly {
+		t.Fatal("expected selectedOnly to remain compatible")
 	}
 }
 

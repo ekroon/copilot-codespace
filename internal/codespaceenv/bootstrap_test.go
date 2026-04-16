@@ -134,10 +134,20 @@ func parseOutput(output string) map[string]string {
 }
 
 func mergeEnv(base []string, updates map[string]string) []string {
-	result := make(map[string]string, len(base)+len(updates))
+	allowed := map[string]struct{}{
+		"HOME":   {},
+		"PATH":   {},
+		"PWD":    {},
+		"TMPDIR": {},
+		"USER":   {},
+	}
+	result := make(map[string]string, len(allowed)+len(updates))
 	for _, kv := range base {
 		key, value, ok := strings.Cut(kv, "=")
 		if ok {
+			if _, keep := allowed[key]; !keep {
+				continue
+			}
 			result[key] = value
 		}
 	}
